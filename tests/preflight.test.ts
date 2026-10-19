@@ -126,7 +126,7 @@ test("la commande /opencode reste enregistree sans opencode", async ($, on) => {
   expect(await $.command.run({ command: 'opencode', args: '' })).toEqual({})
 })
 
-test("opencode en 2.x : l'outil est enregistre", async ($, on) => {
+test("opencode en 2.x : les deux outils sont enregistres", async ($, on) => {
   const clock = mock.clock(on)
   mock.env(on, {})
   const { registered, logs } = stubPreflight(on, { version: 'opencode v2.0.32' })
@@ -134,6 +134,7 @@ test("opencode en 2.x : l'outil est enregistre", async ($, on) => {
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
   await clock.settle()
 
-  expect(registered).toEqual(['delegate'])
+  // `delegate` delegue, `delegations` regarde ce qui a ete delegue
+  expect(registered).toEqual(['delegate', 'delegations'])
   expect(logs).toEqual([])
 })

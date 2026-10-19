@@ -7,6 +7,10 @@
 
 const PANE = 'opencode-delegate'
 const TOOL = 'mcp__opencode-delegate__delegate'
+// Un seul outil de plus, qui porte une action : sa description est relue a
+// chaque tour dans toutes les sessions de tous ceux qui installent le mod, et
+// deux outils voudraient dire deux descriptions a payer.
+const LOOK = 'mcp__opencode-delegate__delegations'
 
 // `$.process.run` plafonne a dix minutes, et c'est aussi notre plafond de tache
 const MAX_TIMEOUT_MS = 600_000
@@ -38,6 +42,15 @@ const GIT_MS = 10_000
 // Le journal d'outils rendu apres une coupe : assez pour voir ce qu'opencode a
 // lu, pas assez pour noyer le resultat
 const MAX_RECOVERED_TOOLS = 20
+// Le journal relu par l'outil de relecture entre dans le contexte de Claude :
+// une session longue en rendrait des milliers de lignes. On borne donc la
+// fenetre, et le resultat dit comment demander la suite.
+const MAX_LOG_TOOLS = 40
+const MAX_LOG_CHARS = 6_000
+const MAX_LOG_TEXT = 1_500
+// Ce qu'on recopie de la reponse brute quand le JSON demande n'est pas venu :
+// assez pour que le travail paye ne soit pas perdu
+const MAX_RAW_ANSWER = 2_000
 // Ce qu'on recopie du texte retrouve dans le transcript, quand c'est la seule
 // voie de sortie (tour abandonne : le resultat de l'outil ne va plus nulle part)
 const LOG_EXCERPT = 1_200
@@ -139,6 +152,10 @@ let opencode = { isReady: false, version: null, reason: "opencode n'a pas encore
 // La verite est ici, en memoire : le store n'en est que la copie durable, ce qui
 // evite qu'un lire-modifier-ecrire en perde une.
 let liveJobs = new Map()
+// La carte que chaque job de fond alimente, par cle de job : c'est par la que
+// le compte rendu, remis bien plus tard, retrouve la tache a marquer comme
+// remise. Le marqueur du store ne peut pas la porter : il est serialise.
+let jobTasks = new Map()
 let jobSeq = 0
 // L'id de la session Claude, qui range nos marqueurs a part de ceux des autres
 let sessionKey = null
@@ -305,15 +322,20 @@ async function recoverPartial($, sessionId) {
   const groups = []
   for (const message of items) {
     if (!message) continue
-    const mine = []
+    const mine = { tools: [], texts: [] }
     // le plus recent d'abord : le premier `outcome` et la premiere erreur
     // rencontres sont les derniers qu'opencode ait enregistres
     if (!outcome && typeof message.outcome === 'string') outcome = message.outcome
     if (!error && message.error && message.error.message) error = message.error.message
     for (const part of message.content || []) {
       if (!part) continue
-      if (part.type === 'text' && typeof part.text === 'string' && !text) {
-        text = part.text.trim() || null
+      if (part.type === 'text' && typeof part.text === 'string') {
+        const said = part.text.trim()
+        // `text` reste la derniere conclusion, comme avant ; le journal, lui,
+        // garde tout ce qui a ete dit, pour que la relecture montre la piste
+        // abandonnee et pas seulement le mot de la fin
+        if (said && !text) text = said
+        if (said) mine.texts.push(said)
       } else if (part.type === 'tool') {
         const name = part.name || part.tool
         const state = part.state || {}
@@ -321,7 +343,7 @@ async function recoverPartial($, sessionId) {
         // meme forme que les appels lus dans le flux, pour que la carte n'ait
         // pas deux sortes d'appels a dessiner
         if (name) {
-          mine.push({
+          mine.tools.push({
             tool: name,
             status: state.status || 'unknown',
             // un outil qui n'a pas abouti le dit dans son libelle : la carte
@@ -334,12 +356,19 @@ async function recoverPartial($, sessionId) {
         }
       }
     }
-    if (mine.length) groups.push(mine)
+    if (mine.tools.length || mine.texts.length) groups.push(mine)
   }
 
   const tools = []
-  for (let i = groups.length - 1; i >= 0; i--) tools.push(...groups[i])
-  return { text, error, outcome, tools: tools.slice(-MAX_RECOVERED_TOOLS) }
+  const texts = []
+  for (let i = groups.length - 1; i >= 0; i--) {
+    tools.push(...groups[i].tools)
+    texts.push(...groups[i].texts)
+  }
+  // `tools` reste borne comme avant, pour les appelants d'avant ; `allTools` et
+  // `texts` sont la lecture complete, dont l'outil de relecture decoupe sa
+  // fenetre. Une seule lecture de `session.message.list` sert les deux.
+  return { text, error, outcome, tools: tools.slice(-MAX_RECOVERED_TOOLS), allTools: tools, texts }
 }
 
 // Ou et sur quoi la tache va tourner. Un agent a conclu de travers parce
@@ -585,8 +614,11 @@ async function touchJob($, job, patch) {
 // file, puis on vide toute la file dans un seul compte rendu. Les jobs qui
 // finissent pendant l'attente de l'inactivite font un second tour, groupe de
 // la meme facon.
-function notify($, report) {
-  pendingReports.push(report)
+function notify($, report, task) {
+  // La carte porte l'etat de remise : tant que le compte rendu n'est pas entre,
+  // `delegations` doit dire qu'il arrive, pour que Claude attende au lieu de
+  // relancer la tache.
+  pendingReports.push({ text: report, task })
   if (isDraining) return
   isDraining = true
   $.clock.after(GROUP_MS, async () => {
@@ -596,6 +628,9 @@ function notify($, report) {
         batch = pendingReports
         pendingReports = []
         await $.prompt.submit({ text: groupReports(batch) })
+        // remis seulement maintenant : avant le `submit`, le compte rendu
+        // n'etait encore nulle part
+        for (const held of batch) if (held.task) held.task.isReported = true
         batch = []
       }
     } catch (err) {
@@ -605,7 +640,7 @@ function notify($, report) {
         "opencode: le compte rendu de la delegation de fond n'a pas pu etre remis (" +
           ((err && err.message) || 'cause inconnue') +
           ') :\n' +
-          batch.join('\n'),
+          batch.map((held) => held.text).join('\n'),
       )
     } finally {
       isDraining = false
@@ -613,7 +648,8 @@ function notify($, report) {
   })
 }
 
-function groupReports(reports) {
+function groupReports(held) {
+  const reports = held.map((one) => one.text)
   if (reports.length === 1) {
     return [
       'Compte rendu de la delegation opencode lancee en arriere-plan. C\'est le resultat differe d\'un',
@@ -712,13 +748,19 @@ async function reportOrphans($, orphans) {
 
   await $.ui.open({ id: PANE, title: 'opencode' })
   for (const job of orphans) {
-    const report = await reportOrphan($, job)
+    const out = await reportOrphan($, job)
     // Passe son budget et la marge, la tache a pu finir toute seule depuis
     // longtemps : ouvrir un tour pour en parler reveillerait la session pour
     // une archeologie. La carte et le transcript le disent, ca suffit.
     const deadline = (job.lastSeenAt || job.startedAt || 0) + (job.timeoutMs || DEFAULT_TIMEOUT_MS)
-    if (Date.now() < deadline + RELOAD_GRACE_MS) notify($, report)
-    else $.ui.log('opencode (delegation de fond perdue par un rechargement) :\n' + report)
+    if (Date.now() < deadline + RELOAD_GRACE_MS) notify($, out.report, out.task)
+    else {
+      $.ui.log('opencode (delegation de fond perdue par un rechargement) :\n' + out.report)
+      // ce compte rendu n'entrera jamais dans un tour : `delegations` doit le
+      // dire plutot que de laisser croire qu'il arrive
+      out.task.isReported = true
+      out.task.isLoggedOnly = true
+    }
   }
 }
 
@@ -734,6 +776,7 @@ async function reportOrphan($, job) {
     agent: job.agent || null,
     mayWrite: Boolean(job.mayWrite),
     isBackground: true,
+    isReported: false,
     sessionId: job.sessionId || null,
     title: job.title || null,
     status: 'failed',
@@ -775,9 +818,377 @@ async function reportOrphan($, job) {
   }
   body.push('', resumeLine(task))
   body.push(...tailLines(task))
-  return body.join('\n')
+  return { report: body.join('\n'), task }
 }
 
+
+// --- la sortie en JSON ----------------------------------------------------
+
+// Ce que la mesure a tranche. opencode 2.0.32 n'a AUCUN champ de schema :
+// le corps de `session.prompt` est `{id, text, files, agents, skills, metadata,
+// delivery, resume}` en `additionalProperties: false`, et un `format` envoye
+// quand meme repart en 200 sans etre garde — le serveur le jette en silence,
+// ce qui est pire qu'un refus. `session.get` n'a pas de `structured_output`, et
+// `opencode run` n'a pas de drapeau de schema (`--format` ne vaut que `default`
+// ou `json`, c'est le rendu). Les deux voies par l'API meurent donc avant meme
+// la question du repertoire de travail.
+//
+// Reste a demander le JSON dans le prompt et a le lire nous-memes. Ce qu'on
+// garantit alors n'est pas le schema : c'est la verification. Le mod demande la
+// forme, relit la reponse, et dit laquelle des deux il tient en main — du JSON
+// conforme, ou du texte. Il n'invente jamais un champ manquant.
+function jsonInstruction(schema) {
+  return [
+    '',
+    '',
+    '---',
+    'CONTRAINTE DE SORTIE, imposee par l\'appelant et non negociable :',
+    "ta reponse finale doit etre un objet JSON valide et RIEN d'autre — pas une phrase avant, pas une",
+    'phrase apres, pas de bloc de code markdown, pas de commentaire. Elle doit respecter ce schema JSON :',
+    '',
+    JSON.stringify(schema, null, 2),
+    '',
+    "Si une information te manque, mets une valeur vide du bon type plutot que de changer la forme.",
+  ].join('\n')
+}
+
+// Le JSON peut arriver nu, dans un bloc de code, ou noye dans une phrase : on
+// tente les trois, du plus propre au plus tolerant, sans jamais reparer le
+// contenu lui-meme
+function extractJson(text) {
+  const said = String(text || '').trim()
+  if (!said) return null
+  const tries = [said]
+  // ```json { ... } ```
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(said)
+  if (fenced) tries.push(fenced[1].trim())
+  // le premier objet equilibre du texte
+  const start = said.indexOf('{')
+  if (start !== -1) {
+    let depth = 0
+    let isInString = false
+    let isEscaped = false
+    for (let i = start; i < said.length; i++) {
+      const ch = said[i]
+      if (isEscaped) {
+        isEscaped = false
+        continue
+      }
+      if (ch === '\\' && isInString) {
+        isEscaped = true
+        continue
+      }
+      if (ch === '"') isInString = !isInString
+      else if (!isInString && ch === '{') depth++
+      else if (!isInString && ch === '}') {
+        depth--
+        if (depth === 0) {
+          tries.push(said.slice(start, i + 1))
+          break
+        }
+      }
+    }
+  }
+  for (const candidate of tries) {
+    try {
+      const parsed = JSON.parse(candidate)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed
+    } catch {
+      // candidat suivant
+    }
+  }
+  return null
+}
+
+function jsonType(value) {
+  if (Array.isArray(value)) return 'array'
+  if (value === null) return 'null'
+  return typeof value
+}
+
+// Une verification volontairement peu ambitieuse : les cles requises, et le type
+// des proprietes declarees au premier niveau. On ne pretend pas valider un
+// schema JSON complet — mieux vaut dire ce qu'on verifie que de laisser croire
+// a une validation qui n'a pas lieu.
+function checkShape(value, schema) {
+  const wrong = []
+  const required = Array.isArray(schema.required) ? schema.required : []
+  for (const key of required) {
+    if (!(key in value)) wrong.push('la cle requise `' + key + '` manque')
+  }
+  const properties = schema.properties && typeof schema.properties === 'object' ? schema.properties : {}
+  for (const [key, declared] of Object.entries(properties)) {
+    if (!(key in value) || !declared || typeof declared !== 'object') continue
+    const wanted = declared.type
+    if (typeof wanted !== 'string') continue
+    const got = jsonType(value[key])
+    // JSON Schema distingue integer et number ; au premier niveau ca suffit
+    const isOk = wanted === 'integer' ? Number.isInteger(value[key]) : got === wanted
+    if (!isOk) wrong.push('`' + key + '` est un ' + got + ' au lieu d\'un ' + wanted)
+  }
+  return wrong
+}
+
+// Ce qui est rendu a la place de la reponse libre, quand un schema a ete demande
+function jsonOutcome(answer, schema) {
+  const said = String(answer || '').trim()
+  if (!said) {
+    return {
+      isJson: false,
+      lines: [
+        "LA SORTIE JSON DEMANDEE N'EST PAS VENUE, et opencode n'a rien conclu du tout : ni JSON, ni texte.",
+        "Il n'y a donc rien a relire ni a rattraper ici. Regarder le journal de la session",
+        '(`' + LOOK + '` avec `action: "log"`) pour voir ou la tache',
+        "s'est arretee avant de la relancer.",
+      ],
+    }
+  }
+  const parsed = extractJson(answer)
+  if (!parsed) {
+    return {
+      isJson: false,
+      lines: [
+        'LA SORTIE JSON DEMANDEE N\'EST PAS VENUE. opencode a repondu du texte, pas un objet JSON.',
+        "Le schema n'est pas impose par le fournisseur : opencode 2 n'a aucun champ de schema, donc le",
+        'mod ne peut que le demander dans le prompt et verifier la reponse. Ici le modele ne l\'a pas suivi.',
+        "Le mod n'invente aucun champ : voici la reponse telle quelle, a lire ou a redemander (un modele",
+        'plus capable, ou un schema plus simple, y arrivent mieux).',
+        '',
+        'Reponse brute :',
+        '',
+        fit(String(answer || '').trim(), MAX_RAW_ANSWER),
+      ],
+    }
+  }
+  const wrong = checkShape(parsed, schema)
+  if (wrong.length) {
+    return {
+      isJson: false,
+      lines: [
+        'JSON VALIDE MAIS HORS SCHEMA : opencode a bien rendu un objet JSON, mais il ne respecte pas la',
+        'forme demandee. Le schema n\'est pas impose par le fournisseur (opencode 2 n\'a aucun champ de',
+        'schema) : le mod le demande et le verifie, c\'est tout. Ce qui ne colle pas :',
+        ...wrong.map((one) => '  - ' + one),
+        '',
+        "L'objet est rendu tel quel, sans aucun champ ajoute ni corrige :",
+        '',
+        JSON.stringify(parsed, null, 2),
+      ],
+    }
+  }
+  return {
+    isJson: true,
+    lines: [
+      'Sortie JSON conforme au schema demande (cles requises presentes, types declares respectes au',
+      'premier niveau ; le mod ne verifie pas plus loin).',
+      '',
+      JSON.stringify(parsed, null, 2),
+    ],
+  }
+}
+
+// --- regarder ses propres delegations -------------------------------------
+
+// 420ms, 3s, 1m12 : la duree d'un appel d'outil
+function span(call) {
+  if (call.ms == null) return ''
+  return call.ms < 1000 ? call.ms + 'ms' : clock(Math.round(call.ms / 1000))
+}
+
+function statusWord(task) {
+  if (task.status === 'running') return 'en cours'
+  if (task.status === 'done') return 'terminee'
+  return 'arretee (' + ((STOPS[task.stop] || {}).word || 'cause inconnue') + ')'
+}
+
+// Ou en est le compte rendu d'une delegation de fond. C'est la ligne qui evite
+// le double paiement : elle dit si Claude doit attendre, ou si c'est deja arrive.
+function deliveryLine(task) {
+  if (!task.isBackground) return null
+  if (task.status === 'running') {
+    return 'fond : le compte rendu arrivera tout seul dans un tour suivant, rien a attendre ni a relancer'
+  }
+  if (task.isLoggedOnly) {
+    return 'fond : compte rendu ecrit dans le transcript seulement, il n\'entrera pas dans un tour — le relire par `action: "log"`'
+  }
+  return task.isReported
+    ? 'fond : compte rendu deja remis dans un tour precedent'
+    : 'fond : compte rendu pas encore remis, il arrive dans un tour suivant'
+}
+
+// La liste des delegations de la session, l'equivalent de `$.agent.list()` :
+// tout est deja en memoire, aucun appel de CLI.
+function delegationList() {
+  if (tasks.length === 0) {
+    return [
+      "Aucune delegation opencode dans cette session : rien n'a ete lance, donc rien n'est en vol,",
+      "rien n'est a attendre, et aucun compte rendu de fond ne va arriver.",
+    ].join('\n')
+  }
+
+  const running = tasks.filter((task) => task.status === 'running')
+  const waiting = tasks.filter((task) => task.isBackground && task.status !== 'running' && !task.isReported)
+
+  const head = [
+    tasks.length +
+      (tasks.length > 1 ? ' delegations opencode' : ' delegation opencode') +
+      ' dans cette session, la plus recente en premier.',
+    running.length
+      ? running.length + (running.length > 1 ? ' tournent encore.' : ' tourne encore.')
+      : 'Aucune ne tourne encore.',
+    '',
+    "Une delegation « en cours » est deja en vol : ne pas relancer la meme tache, elle serait payee",
+    'deux fois. Si sa reponse est necessaire pour la suite du raisonnement, attendre son compte rendu',
+    'plutot que de la relancer.',
+  ]
+  if (waiting.length) {
+    head.push(
+      '',
+      waiting.length +
+        (waiting.length > 1 ? ' delegations de fond ont fini' : ' delegation de fond a fini') +
+        " mais n'" +
+        (waiting.length > 1 ? 'ont' : 'a') +
+        ' pas encore remis son compte rendu : il arrive tout seul dans un tour suivant.',
+    )
+  }
+
+  const bodies = tasks.map((task, index) => {
+    const calls = (task.status === 'running' ? task.liveCalls : null) || task.toolCalls || []
+    const facts = [
+      duration(task),
+      money(task.cost),
+      tokens(task),
+      calls.length ? calls.length + (calls.length > 1 ? " appels d'outils" : " appel d'outil") : null,
+      task.runs > 1 ? task.runs + ' reprises' : null,
+      task.mayWrite ? 'ecriture autorisee' : 'lecture seule',
+    ]
+      .filter(Boolean)
+      .join(' \u00b7 ')
+    return [
+      '#' +
+        (index + 1) +
+        '  ' +
+        statusWord(task) +
+        '  \u00b7  ' +
+        shortModel(task.model) +
+        '  \u00b7  ' +
+        (task.sessionId ? 'session opencode: ' + task.sessionId : 'session opencode non retrouvee'),
+      '    ' + facts,
+      deliveryLine(task) ? '    ' + deliveryLine(task) : null,
+      task.error ? '    erreur : ' + fit(task.error, 160) : null,
+      '    tache : ' + fit((task.prompt || '').replace(/\s+/g, ' '), 200),
+    ]
+      .filter(Boolean)
+      .join('\n')
+  })
+
+  const foot = [
+    '',
+    "Pour relire ce qu'une delegation a lu, appele et conclu sans la repayer : rappeler cet outil avec",
+    '`action: "log"` et son id de session opencode. Pour continuer une conversation opencode : `' +
+      TOOL +
+      '` avec `resume`.',
+  ]
+
+  return [...head, '', ...bodies, ...foot].join('\n')
+}
+
+// Le journal d'une delegation, relu dans sa session opencode. La lecture est
+// celle de `recoverPartial` : une seule facon de lire `session.message.list`
+// dans le mod, et donc une seule a pouvoir se tromper.
+async function delegationLog($, sessionId, opts) {
+  const wanted = String(sessionId || '').trim()
+  if (!wanted) {
+    return (
+      '`action: "log"` demande un `sessionId` : l\'id de session opencode d\'une delegation. ' +
+      '`action: "list"` donne celui de chacune.'
+    )
+  }
+
+  const partial = await recoverPartial($, wanted)
+  if (!partial) {
+    return [
+      "Le journal de la session opencode " + wanted + " n'a pas pu etre relu : soit cet id n'existe pas,",
+      "soit le service de fond d'opencode ne repond pas. Verifier l'id par `action: \"list\"`.",
+      "Rien n'a ete relance : cet outil ne fait que lire.",
+    ].join('\n')
+  }
+
+  const all = partial.allTools || []
+  const offset = Math.max(0, Math.floor(Number(opts.offset) || 0))
+  const window = all.slice(offset, offset + MAX_LOG_TOOLS)
+  const isToolsOnly = Boolean(opts.toolsOnly)
+
+  const head = [
+    'Journal de la session opencode ' + wanted + ', relu sans rien relancer ni repayer.',
+    all.length
+      ? all.length +
+        (all.length > 1 ? " appels d'outils au total" : " appel d'outil au total") +
+        (window.length
+          ? ', affiches ' + (offset + 1) + '-' + (offset + window.length) + ' (du plus ancien au plus recent).'
+          : ' — rien a cet `offset`.')
+      : "Aucun appel d'outil dans cette session.",
+  ]
+  if (partial.outcome) head.push('Issue enregistree par opencode : ' + partial.outcome + '.')
+  if (partial.error) head.push('Derniere erreur enregistree : ' + fit(partial.error, 300))
+
+  const rows = window.map((call, index) => {
+    const at = String(offset + index + 1).padStart(3, ' ')
+    const took = span(call)
+    return at + '. ' + (call.title || call.tool) + (took ? '  ' + took : '')
+  })
+
+  const lines = [...head, ...(rows.length ? ['', ...rows] : [])]
+
+  // Les textes passent apres les appels : c'est la partie qui peut etre enorme,
+  // et c'est donc elle qu'on sacrifie quand la place manque
+  const notes = []
+  if (!isToolsOnly && partial.texts && partial.texts.length) {
+    notes.push(
+      '',
+      "Ce qu'opencode a dit (" +
+        partial.texts.length +
+        (partial.texts.length > 1 ? ' prises de parole' : ' prise de parole') +
+        ', de la plus ancienne a la derniere) :',
+    )
+    let budget = MAX_LOG_CHARS - lines.join('\n').length
+    let shown = 0
+    for (const said of partial.texts) {
+      const piece = fit(said.replace(/\s+/g, ' '), MAX_LOG_TEXT)
+      if (piece.length + 8 > budget) break
+      budget -= piece.length + 8
+      shown += 1
+      notes.push('', '--- ' + shown + ' ---', piece)
+    }
+    if (shown < partial.texts.length) {
+      notes.push(
+        '',
+        '(' +
+          (partial.texts.length - shown) +
+          " prises de parole de plus, laissees de cote pour tenir dans la place : elles sont dans la session.)",
+      )
+    }
+  }
+
+  const foot = []
+  if (offset + window.length < all.length) {
+    foot.push(
+      '',
+      'Journal tronque : il reste ' +
+        (all.length - offset - window.length) +
+        " appels d'outils. Pour la suite, rappeler cet outil avec `action: \"log\"`, `sessionId: \"" +
+        wanted +
+        '"`, `offset: ' +
+        (offset + window.length) +
+        '`.',
+    )
+  }
+  if (!isToolsOnly && partial.texts && partial.texts.length) {
+    foot.push("Pour ne lire que les appels d'outils, sans les textes : `toolsOnly: true`.")
+  }
+
+  return [...lines, ...notes, ...foot].join('\n')
+}
 
 // --- la delegation elle-meme ----------------------------------------------
 
@@ -838,6 +1249,9 @@ async function runDelegation($, spec, next, job) {
     mayWrite,
     isBackground: Boolean(spec.isBackground),
     sessionId: sessionId || task.sessionId,
+    // une delegation de fond ne rend rien a l'appel qui l'a lancee : sa carte
+    // porte donc si son compte rendu est deja entre dans un tour
+    isReported: spec.isBackground ? false : undefined,
     status: 'running',
     startedAt: Date.now(),
     timeoutMs,
@@ -849,6 +1263,7 @@ async function runDelegation($, spec, next, job) {
   task.segments.push({ startedAt: task.startedAt })
   // la reprise repasse la carte en tete, et dans « En cours »
   tasks = resumed ? [task, ...tasks.filter((item) => item !== task)] : [task, ...tasks]
+  if (job) jobTasks.set(job.key, task)
 
   await touchJob($, job, { checkout, sessionId: task.sessionId || undefined })
   await $.ui.open({ id: PANE, title: 'opencode' })
@@ -899,7 +1314,10 @@ async function runDelegation($, spec, next, job) {
   if (mayWrite) argv.push('--auto')
   if (spec.resume) argv.push('--session', spec.resume)
   if (agent) argv.push('--agent', agent)
-  argv.push(task.prompt)
+  // La contrainte de forme s'ajoute au prompt envoye a opencode, pas a
+  // `task.prompt` : la carte du pane et le marqueur du job continuent de
+  // montrer la tache demandee, pas notre boilerplate
+  argv.push(spec.schema ? task.prompt + jsonInstruction(spec.schema) : task.prompt)
 
   const init = { timeoutMs }
   if (spec.dir) init.cwd = spec.dir
@@ -1009,6 +1427,13 @@ async function runDelegation($, spec, next, job) {
   $.ui.invalidate('ui.render')
   $.ui.toast('opencode: termine en ' + duration(task))
 
+  if (spec.schema) {
+    const outcome = jsonOutcome(parsed.text, spec.schema)
+    task.isJsonOk = outcome.isJson
+    $.ui.invalidate('ui.render')
+    return { result: outcome.lines.join('\n') + tailLines(task).join('\n') }
+  }
+
   const answer = parsed.text || '(opencode a fini sans texte de reponse)'
   return { result: answer + tailLines(task).join('\n') }
 }
@@ -1087,6 +1512,11 @@ export function register(on) {
           'ensemble, donc une delegation courte groupee avec une longue reste',
           "invisible jusqu'a ce que la longue finisse. Elles tournent bien en",
           'parallele, mais rien ne revient avant la derniere.',
+          'Passer un `schema` (JSON Schema) pour recevoir des donnees plutot',
+          "qu'un paragraphe : le mod ajoute la contrainte au prompt et verifie la",
+          'reponse. Ce schema n\'est pas impose au fournisseur, qui n\'en a pas les',
+          'moyens : quand le modele ne le suit pas, le resultat le dit et rend la',
+          'reponse brute.',
           "Passer `background: true` quand la reponse d'opencode n'est pas",
           'necessaire pour raisonner dans ce tour-ci : l\'appel rend la main tout',
           'de suite et le compte rendu complet revient plus tard, tout seul, sans',
@@ -1131,6 +1561,11 @@ export function register(on) {
               description:
                 "Budget de temps en millisecondes, 300000 par defaut, 600000 au maximum. Au-dela, la tache est coupee : le resultat le dit et rend ce qu'opencode avait deja produit, ce qui permet de relancer plus large en connaissance de cause.",
             },
+            schema: {
+              type: 'object',
+              description:
+                "Objet JSON Schema decrivant la forme attendue de la reponse, pour recevoir des donnees plutot qu'un paragraphe. ATTENTION a ce que ca garantit : opencode n'a aucun champ de schema, donc le mod ne peut pas l'imposer au fournisseur. Il ajoute la contrainte au prompt, puis relit la reponse et dit laquelle des deux il tient : du JSON conforme, ou du texte. Quand le modele ne suit pas, le resultat le dit et rend la reponse brute, sans jamais inventer un champ. Ne pas en dependre pour une sortie critique sans la verifier, et prendre un schema simple et peu profond : seules les cles requises et les types declares au premier niveau sont verifies.",
+            },
             background: {
               type: 'boolean',
               description:
@@ -1138,6 +1573,56 @@ export function register(on) {
             },
           },
           required: ['prompt'],
+        },
+        isDeferred: false,
+      })
+
+      // Un seul outil de plus, qui porte une action, plutot que deux : sa
+      // description est relue a chaque tour dans toutes les sessions de tous
+      // ceux qui installent le mod, et les deux capacites repondent de toute
+      // facon a la meme question — « qu'est-ce que j'ai delegue, et qu'en
+      // est-il ? ».
+      await $.tool.register({
+        name: 'delegations',
+        description: [
+          'Regarde les delegations opencode de cette session. Ne lance rien et ne',
+          'repaye rien.',
+          '`action: "list"` rend la liste : statut, modele, id de session opencode,',
+          'duree, cout, tokens, nombre d\'appels d\'outils, et pour une tache de fond',
+          'si son compte rendu a deja ete remis. A appeler avant de deleguer une',
+          'tache qui ressemble a une autre, pour ne pas relancer ce qui est deja en',
+          'vol, et pour decider d\'attendre un compte rendu plutot que de le repayer.',
+          '`action: "log"` avec `sessionId` rend le journal d\'une delegation : les',
+          'outils qu\'opencode a appeles, dans l\'ordre, et ce qu\'il a dit — de quoi',
+          'savoir quels fichiers ont ete lus ou quelle piste a ete abandonnee sans',
+          'relancer la tache. La sortie est bornee et dit comment demander la suite.',
+        ].join(' '),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: {
+              type: 'string',
+              enum: ['list', 'log'],
+              description:
+                "`list` pour les delegations de cette session, `log` pour le journal de l'une d'elles.",
+            },
+            sessionId: {
+              type: 'string',
+              description:
+                "Pour `log` : l'id de session opencode de la delegation a relire, tel que `list` ou le resultat d'une delegation le donne.",
+            },
+            offset: {
+              type: 'number',
+              description:
+                "Pour `log` : par quel appel d'outil commencer, quand une sortie tronquee a dit qu'il en restait.",
+            },
+            toolsOnly: {
+              type: 'boolean',
+              description:
+                "Pour `log` : ne rendre que les appels d'outils, sans les textes d'opencode. A prendre quand seuls les fichiers lus comptent, ou quand la sortie complete est trop longue.",
+            },
+          },
+          required: ['action'],
         },
         isDeferred: false,
       })
@@ -1204,6 +1689,12 @@ export function register(on) {
         'rend la main tout de suite et le compte rendu revient plus tard tout seul,',
         'dans un tour a lui : a prendre quand la reponse n\'est pas necessaire pour',
         'raisonner dans le meme tour, pour rester disponible pendant la tache.',
+        '',
+        "`" + LOOK + "` regarde ces delegations sans",
+        "rien relancer : `action: \"list\"` dit ce qui tourne encore et si un compte",
+        'rendu de fond est deja remis — a consulter avant de deleguer une tache qui',
+        "ressemble a une autre, plutot que de payer deux fois la meme. `action:",
+        '"log"` avec un `sessionId` relit le journal d\'une delegation finie.',
       ].join('\n'),
     }
     return { blocks: [...below.blocks, block] }
@@ -1253,6 +1744,18 @@ export function register(on) {
       dir: e.dir,
       resume: e.resume || null,
       isBackground,
+      schema: e.schema || null,
+    }
+
+    // Un schema mal forme ne part pas en silence : c'est precisement le defaut
+    // qu'on reproche a opencode, qui jette un `format` inconnu sans rien dire
+    if (spec.schema && (typeof spec.schema !== 'object' || Array.isArray(spec.schema))) {
+      return {
+        result:
+          '`schema` doit etre un objet JSON Schema (par exemple `{"type":"object","properties":' +
+          '{"fichiers":{"type":"array"}},"required":["fichiers"]}`). Rien ne s\'est execute. ' +
+          'Reessayer avec un schema bien forme, ou sans `schema` pour une reponse en texte libre.',
+      }
     }
 
     if (!isBackground) return runDelegation($, spec, next)
@@ -1299,9 +1802,11 @@ export function register(on) {
           ((err && err.message) || 'cause inconnue') +
           '. Rien ne garantit que la tache n\'a pas tourne : regarder le pane `/opencode` avant de relancer.'
       }
+      const card = jobTasks.get(job.key)
+      jobTasks.delete(job.key)
       liveJobs.delete(job.key)
       await saveJobs($)
-      notify($, report)
+      notify($, report, card)
     })
 
     return { result: launched(spec) }
@@ -1310,6 +1815,25 @@ export function register(on) {
     // reste sans reponse : on rend l'echec lisible pour Claude
     const why = (next.error && next.error.message) || 'cause inconnue'
     return { result: 'opencode-delegate a echoue avant de lancer la tache: ' + why }
+  })
+
+  // Regarder ses delegations ne touche a rien : pas d'interrupteur a lire, pas
+  // de budget, pas de processus lance. `list` ne fait meme aucun appel de CLI.
+  on('tool.call', { tool: LOOK }, async ($, e) => {
+    if (e.action === 'log') {
+      return { result: await delegationLog($, e.sessionId, { offset: e.offset, toolsOnly: e.toolsOnly }) }
+    }
+    if (e.action === 'list') return { result: delegationList() }
+    return {
+      result:
+        '`action` doit valoir "list" (les delegations de cette session) ou "log" (le journal de l\'une ' +
+        'd\'elles, avec son `sessionId`). Recu : ' +
+        JSON.stringify(e.action) +
+        '.',
+    }
+  }).catch(async ($, e, next) => {
+    const why = (next.error && next.error.message) || 'cause inconnue'
+    return { result: 'opencode-delegate n\'a pas pu lire ses delegations: ' + why }
   })
 
   on('ui.render', { component: 'Pane' }, async ($, e, next) => {
@@ -1429,6 +1953,8 @@ export function register(on) {
         // une tache de fond ne rend rien a l'appel qui l'a lancee : le dire sur
         // la carte, c'est dire ou son resultat va arriver
         task.isBackground ? 'fond' : null,
+        // seulement quand un schema a ete demande : sinon il n'y a rien a dire
+        task.isJsonOk === true ? 'json ok' : task.isJsonOk === false ? 'json manque' : null,
         task.stop ? STOPS[task.stop].word : null,
       ]
         .filter(Boolean)
@@ -1451,15 +1977,15 @@ export function register(on) {
       const rows = !isOpen
         ? []
         : calls.slice(0, 12).map((call, index) => {
-            const span = call.ms == null ? '' : call.ms < 1000 ? call.ms + 'ms' : clock(Math.round(call.ms / 1000))
+            const took = span(call)
             return Box({
               key: 'call-' + task.id + '-' + index,
               flexDirection: 'row',
               justifyContent: 'space-between',
               columnGap: 1,
               children: [
-                Text({ dimColor: true, children: [fit(call.title || call.tool, Math.max(inner - span.length - 4, 8))] }),
-                Text({ dimColor: true, children: [span] }),
+                Text({ dimColor: true, children: [fit(call.title || call.tool, Math.max(inner - took.length - 4, 8))] }),
+                Text({ dimColor: true, children: [took] }),
               ],
             })
           })

@@ -31,6 +31,13 @@ Mod Claude Code qui utilise **opencode 2** comme sous-agent.
   rendu plus tard, dans un tour à lui, pour que l'orchestrateur reste disponible
   pendant qu'opencode travaille : voir
   [La délégation en arrière-plan](#la-délégation-en-arrière-plan).
+- Enregistre un second outil `mcp__opencode-delegate__delegations` qui **regarde**
+  ces délégations sans rien relancer : `action: "list"` pour celles de la session,
+  `action: "log"` pour le journal de l'une d'elles : voir
+  [Voir ses propres délégations](#voir-ses-propres-délégations).
+- Accepte un `schema` sur une délégation pour recevoir **des données plutôt qu'un
+  paragraphe** — en disant exactement ce que ça garantit, et ce que ça ne garantit
+  pas : voir [La sortie en JSON](#la-sortie-en-json).
 
 ## Le pane
 
@@ -318,6 +325,172 @@ peut pas entrer (prompt refusé, session qui se ferme), le compte rendu est écr
 dans le transcript par `$.ui.log` — la seule voie qui reste pour rendre ce qui a
 été payé.
 
+## Voir ses propres délégations
+
+Depuis que l'arrière-plan existe, Claude pouvait lancer des délégations de fond
+puis n'avait plus aucun moyen de savoir ce qui tournait : l'utilisateur voyait le
+pane, lui était aveugle. Son équivalent natif est `$.agent.list()`.
+
+`mcp__opencode-delegate__delegations` comble ça. Il ne lance rien, ne paye rien,
+et `action: "list"` ne fait **aucun appel de CLI** — tout est déjà en mémoire
+dans le mod.
+
+### `action: "list"`
+
+Rend les délégations de la session, la plus récente d'abord : statut, modèle, id
+de session opencode, durée, coût, tokens, nombre d'appels d'outils, et pour une
+tâche de fond **si son compte rendu a déjà été remis ou non**.
+
+```
+2 delegations opencode dans cette session, la plus recente en premier.
+1 tourne encore.
+
+Une delegation « en cours » est deja en vol : ne pas relancer la meme tache,
+elle serait payee deux fois. Si sa reponse est necessaire pour la suite du
+raisonnement, attendre son compte rendu plutot que de la relancer.
+
+#1  en cours  ·  glm-5.3-flash-free  ·  session opencode: ses_eac6810…
+    6m02 · $0.0031 · 12.4k tokens · 15 appels d'outils · lecture seule
+    fond : le compte rendu arrivera tout seul dans un tour suivant, rien a
+    attendre ni a relancer
+    tache : parite des cles i18n fr/en dans apps/mobile
+```
+
+Deux choses que ça débloque, et que `tests/visibility.test.ts` vérifie :
+
+- **ne pas relancer une tâche déjà en vol.** Une délégation `en cours` est
+  reconnaissable avant d'être relancée, et le texte le dit explicitement : la
+  relancer la ferait payer deux fois.
+- **pouvoir décider d'attendre.** Entre l'instant où une tâche de fond finit et
+  celui où son compte rendu entre dans un tour, il y a la fenêtre de
+  regroupement : la liste dit `pas encore remis, il arrive dans un tour suivant`,
+  puis `deja remis dans un tour precedent`. Claude peut donc attendre au lieu de
+  repayer. Le cas dégradé est dit aussi : un compte rendu qui n'a pu aller que
+  dans le transcript (`claude -p`, Agent SDK, prompt refusé) est annoncé comme
+  tel, parce qu'il n'entrera jamais dans un tour.
+
+### `action: "log"`
+
+Avant, Claude ne récupérait que le texte final. Pour savoir quels fichiers
+avaient été lus ou quelle piste avait été abandonnée, il devait relancer la tâche
+et la repayer. `session.message.list` donne déjà tout, et `recoverPartial` savait
+déjà le lire : `log` **réutilise cette lecture**, étendue pour rendre le journal
+complet en plus de la tranche bornée que les appelants d'avant utilisent. Une
+seule façon de lire `session.message.list` dans le mod, donc une seule à pouvoir
+se tromper.
+
+```
+Journal de la session opencode ses_eac6810…, relu sans rien relancer ni repayer.
+95 appels d'outils au total, affiches 1-40 (du plus ancien au plus recent).
+
+  1. read taxonomy.ts  420ms
+  2. grep i18n (error)  3s
+  …
+
+Ce qu'opencode a dit (2 prises de parole, de la plus ancienne a la derniere) :
+
+--- 1 ---
+piste abandonnee : la taxonomie ne porte pas les cles
+…
+
+Journal tronque : il reste 55 appels d'outils. Pour la suite, rappeler cet outil
+avec `action: "log"`, `sessionId: "ses_eac6810…"`, `offset: 40`.
+```
+
+Le volume est le vrai risque : une session longue peut rendre énormément, et le
+résultat d'un outil entre dans le contexte de Claude. Donc : fenêtre de 40 appels
+d'outils, 6 000 caractères au total, 1 500 par prise de parole. La sortie **dit
+quand elle est tronquée** et donne l'`offset` pour la suite ; `toolsOnly: true`
+laisse les textes de côté quand seuls les fichiers lus comptent. Les textes
+passent après les appels parce que c'est la partie qui peut exploser, et donc
+celle qu'on sacrifie quand la place manque.
+
+Un id qui n'existe pas, ou un service de fond muet, ne donne pas un faux journal
+vide : le résultat dit que la relecture a échoué, et que rien n'a été relancé.
+
+### Un seul outil, qui porte une action
+
+La description d'un outil enregistré est relue **à chaque tour, dans toutes les
+sessions de tous ceux qui installent le mod**. Celle de `delegate` est déjà
+longue. Deux outils de plus auraient voulu dire deux descriptions à payer en
+permanence, pour deux capacités qui répondent de toute façon à la même question :
+« qu'est-ce que j'ai délégué, et qu'en est-il ? ». D'où un seul outil portant une
+`action`, et des descriptions serrées.
+
+## La sortie en JSON
+
+L'idée : qu'un orchestrateur reçoive `{"fichiers": [...], "risques": [...]}`
+plutôt qu'un paragraphe à relire. Avant d'implémenter quoi que ce soit, la
+question était de savoir par où c'était possible. **La mesure a tranché, et elle
+a écarté les deux voies par l'API.**
+
+### Ce que la mesure a montré
+
+Sur opencode **v2.0.32**, mesuré avec de vraies commandes :
+
+- Le corps de `session.prompt` est
+  `{id, text, files, agents, skills, metadata, delivery, resume}`, en
+  `additionalProperties: false`. **Il n'y a aucun champ de schéma.** Le `format`
+  documenté côté SDK n'existe pas sur cette surface HTTP.
+- Pire : un `format` envoyé quand même repart en **200**, et le message stocké ne
+  garde que `{"text": "…"}`. Le serveur **jette le champ en silence**. Un mod bâti
+  là-dessus aurait cru demander un schéma sans jamais être prévenu du contraire.
+  Même chose pour `response_format` et `outputSchema`.
+- `session.get` rend `id, projectID, cost, tokens, outcome, time, title,
+  location` : **pas de `structured_output`**. La chaîne « structured » n'apparaît
+  nulle part dans les 818 schémas de l'OpenAPI du serveur.
+- `opencode run` n'a pas de drapeau de schéma — `--format` ne vaut que `default`
+  ou `json`, c'est le rendu.
+- Et pour mémoire, reconfirmé au passage : une session créée par
+  `session.create` depuis `/tmp` se voit attribuer
+  `location.directory: /Users/paul`, le répertoire du service de fond.
+
+Donc les deux premières voies ne meurent même pas sur la question du répertoire
+de travail : elles meurent avant, faute de champ pour porter le schéma. La
+troisième voie — demander le JSON dans le prompt et le lire nous-mêmes — est la
+seule qui tient, et elle ne sacrifie rien, puisqu'elle garde `opencode run` et
+donc le bon répertoire.
+
+### Ce que le mod garantit, et ce qu'il ne garantit pas
+
+**Il ne garantit pas** que la réponse respecte le schéma. Il ne peut pas :
+opencode n'offre aucun moyen de l'imposer au fournisseur. Un `schema` passé à
+l'outil **n'est pas une contrainte, c'est une demande**.
+
+**Il garantit** la vérification, et l'honnêteté sur son résultat :
+
+- il ajoute la contrainte de forme au prompt envoyé à opencode (le schéma y est
+  recopié tel quel), après la tâche demandée, sans toucher au prompt affiché dans
+  le pane ;
+- il relit la réponse et dit **laquelle des deux il tient en main** : du JSON
+  conforme, ou du texte ;
+- il lit le JSON nu, dans un bloc ```` ```json ````, ou noyé dans une phrase (le
+  premier objet équilibré) ;
+- quand le modèle rend du texte, le résultat le dit en clair, explique que le
+  schéma n'est pas imposable, et **rend la réponse brute** : le travail payé
+  n'est pas jeté ;
+- quand le JSON est valide mais hors schéma, il dit ce qui ne colle pas (clé
+  requise absente, type déclaré non respecté) et rend l'objet **tel quel** ;
+- il **n'invente jamais un champ manquant** et ne corrige rien ;
+- un `schema` mal formé ne part pas en silence — c'est précisément le défaut
+  reproché à opencode : rien ne tourne, et le résultat le dit.
+
+La vérification est volontairement peu ambitieuse, et le résultat l'annonce :
+**clés requises présentes et types déclarés au premier niveau**, rien de plus.
+Pas de validation JSON Schema complète, pas de récursion. Mieux vaut dire ce
+qu'on vérifie que de laisser croire à une validation qui n'a pas lieu. D'où le
+conseil, dans la description du champ : schéma simple et peu profond, et ne pas
+en dépendre pour une sortie critique sans la vérifier.
+
+### Ce qui reste non mesuré
+
+**À quelle fréquence un modèle donné suit la consigne.** Les essais sur
+`opencode/deepseek-v4.1-flash-free` sont tous repartis en `provider.quota` /
+`FreeUsageLimitError` (429) : le palier gratuit était épuisé. Le taux de
+conformité est donc une inconnue, et c'est de toute façon une propriété du
+modèle, pas du mod. Le comportement du mod face aux deux cas, lui, est testé de
+bout en bout (`tests/jsonshape.test.ts`).
+
 ## Permissions
 
 Toute délégation part en **lecture seule** : `--agent plan`, l'agent read-only
@@ -517,7 +690,20 @@ quand elles tombent ensemble.
   Code par managed settings : seuls les plugins listés par l'organisation y ont
   droit. À savoir si le mod part un jour dans l'équipe par ce canal.
 - Le pane ne rend rien en `claude -p` ni dans l'Agent SDK.
-- `tasks` grandit sans limite sur la durée de la session.
+- `tasks` grandit sans limite sur la durée de la session, et `action: "list"`
+  les rend toutes : une session qui délègue des dizaines de fois finira par
+  rendre une liste longue.
+- `action: "list"` ne voit que les délégations de **la session en cours**. Celles
+  d'une autre session Claude, ou d'avant un rechargement du mod, n'y sont pas —
+  seul un job de fond perdu par un rechargement revient, par son marqueur.
+- Le `schema` d'une délégation n'est **pas imposé** au fournisseur, et ne peut pas
+  l'être : opencode 2.0.32 n'a aucun champ de schéma. Voir
+  [La sortie en JSON](#la-sortie-en-json) pour la mesure et pour ce qui est
+  réellement garanti.
+- La vérification du schéma s'arrête aux clés requises et aux types déclarés au
+  **premier niveau**. Un objet imbriqué non conforme passe pour conforme.
+- Le taux de conformité des modèles au schéma demandé n'a **pas pu être mesuré**
+  (palier gratuit épuisé, 429).
 - Une délégation de fond **ne peut pas être annulée** : ni le pane ni l'outil
   n'offrent de bouton pour tuer un `$.process.run` en vol. Elle s'arrête d'elle
   même à son budget.
