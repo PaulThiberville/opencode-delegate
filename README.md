@@ -202,7 +202,6 @@ qu'opencode lisait un checkout en retard, sans que personne puisse s'en
 apercevoir. Attention, `git rev-list --count HEAD..@{upstream}` mesure le retard
 sur l'amont **tel que le dernier `fetch` l'a laissé**, pas sur le dépôt distant
 maintenant : le mod ne fetche pas tout seul.
-
 ## Permissions
 
 Toute délégation part en **lecture seule** : `--agent plan`, l'agent read-only
@@ -210,72 +209,53 @@ d'opencode, et pas de `--auto`. opencode lit le dépôt et rend un compte rendu.
 C'est le mode le plus sûr qui reste utile, et c'est celui que Claude obtient
 sans rien demander.
 
-Pour une tâche qui doit écrire, Claude passe `writeFiles: true`. Le mod demande
-alors à l'utilisateur, par `$.ui.ask`, s'il laisse opencode écrire, en nommant la
-tâche et le répertoire. Trois réponses :
+Pour qu'une délégation écrive, deux conditions doivent être réunies : Claude
+passe `writeFiles: true`, **et** l'utilisateur a armé l'écriture avec
+l'interrupteur du pane `/opencode`. Si l'une manque, rien ne s'exécute et
+l'outil le dit à Claude, qui peut relancer sans `writeFiles`.
 
-| Réponse | Ce qui part |
+| État | Ce qui part |
 | :- | :- |
-| `Autoriser l'ecriture` | `opencode run --auto`, avec l'`agent` demandé s'il y en a un |
-| `Lecture seule` | la tâche tourne en `--agent plan`, sans `--auto` |
-| `Annuler`, ou la question écartée | **rien** ne s'exécute |
-
-`$.ui.ask` **rejette** quand la question est écartée et dans un `claude -p`, où
-personne ne peut répondre. Dans les deux cas la délégation n'a pas lieu et
-l'outil le dit à Claude, qui peut relancer sans `writeFiles`. Une écriture ne
-peut donc jamais être la conséquence d'un silence.
+| `writeFiles` absent | `--agent plan`, sans `--auto`, quel que soit l'interrupteur |
+| `writeFiles: true`, écriture désarmée | **rien** ; le pane s'ouvre et le résultat dit quoi faire |
+| `writeFiles: true`, écriture armée | `opencode run --auto`, avec l'`agent` demandé s'il y en a un |
 
 En lecture seule, l'argument `agent` est **ignoré** et `plan` est imposé : sans
 ça, un `agent: 'build'` choisi par Claude rouvrirait l'écriture par la porte de
-derrière. L'`agent` n'est honoré qu'une fois l'écriture autorisée.
+derrière. L'`agent` n'est honoré qu'une fois l'écriture armée.
 
 Le pied de page rendu à Claude et la carte du pane nomment le mode retenu, pour
 qu'une tâche dégradée en lecture seule ne passe pas pour une tâche qui a écrit.
 
-### Une seule délégation en écriture à la fois
+### Pourquoi un interrupteur, et pourquoi il se désarme
 
-Le moteur ne tient **qu'un `AskUserQuestion` à la fois**. Deux délégations en
-écriture lancées coup sur coup dans le même tour, et la seconde question revient
-en refus — sans que personne ait rien refusé. Claude lisait alors un « non » de
-l'utilisateur qui n'existait pas.
+Pourquoi un point de contrôle tout court : opencode tourne avec `--auto`, donc
+il approuve lui-même ce qu'il fait, dans un sous-processus. Ses écritures ne
+passent ni par le mode auto de Claude Code, ni par les règles de permission, ni
+par le classificateur. L'interrupteur est le seul endroit où une personne
+décide.
 
-Le mod refuse donc lui-même la seconde, avec un message qui dit quoi faire :
-attendre le résultat de la première, puis rappeler l'outil. C'est écrit dans la
-description de l'outil, pour que Claude ne lance pas deux demandes en parallèle
-en premier lieu. Le garde-fou ne porte que sur l'écriture : les délégations en
-lecture seule ne demandent rien et peuvent partir en parallèle.
+Pourquoi pas l'argument d'outil seul : `writeFiles: true` ferait du modèle
+l'autorité, et un mod public installé par n'importe qui écrirait dans le dépôt
+sans que personne ait rien dit. L'argument survit comme **signal** — il dit que
+la tâche a besoin d'écrire — il n'autorise rien.
 
-Le garde-fou retient la *date* de la question en cours, pas un booléen : un hook
-tué en pleine question ne remet rien à zéro, et un drapeau resté levé
-interdirait l'écriture pour tout le processus. Au-delà de quinze minutes il est
-tenu pour périmé.
+Pourquoi pas une question à chaque délégation : c'est ce que faisait le mod
+avant, par `$.ui.ask`. L'autorisation était alors la plus précise possible, mais
+la friction retombait sur chaque appel, et le moteur ne tenant qu'une question à
+la fois, deux délégations en écriture dans le même tour faisaient revenir la
+seconde en faux refus.
 
-Sérialiser au lieu de refuser était tentant : faire attendre la seconde que la
-première soit répondue. Mais attendre une promesse qui n'est pas un appel de
-`$` consomme le budget propre du hook (10 s), et une question attend une
-personne, donc des minutes : le second hook serait déclaré absent avant d'avoir
-posé sa question.
+L'interrupteur vit **dans le module du mod, pas dans `$.store`**, et c'est
+délibéré : le stocker le garderait armé d'une session à l'autre et d'un dépôt à
+l'autre, et une case cochée un mardi autoriserait les écritures du mercredi
+ailleurs. Au niveau module, il se remet à zéro à chaque session Claude Code, et
+à chaque rechargement du mod — une mise à jour du plugin, un `/reload-plugins`.
+Un `/clear` ne le désarme pas : le module reste chargé, et son état reste
+visible dans le pane.
 
-### Pourquoi `$.ui.ask` plutôt qu'un argument d'outil ou un interrupteur de pane
-
-Les trois mécanismes étaient sur la table. `$.ui.ask` gagne parce que c'est le
-seul dont l'autorisation vient de l'utilisateur, au moment de l'écriture, pour
-cette écriture-là.
-
-- **Un argument d'outil seul** (`writeFiles: true` et on part) ferait du modèle
-  l'autorité : Claude s'accorderait la permission qu'il demande, et un mod public
-  installé par n'importe qui écrirait dans le dépôt sans que personne ait rien
-  dit. L'argument survit, mais comme **signal** : il déclenche la question, il ne
-  la remplace pas.
-- **Un interrupteur dans le pane** armerait l'écriture une fois, de façon
-  invisible au moment des délégations suivantes, et comme le reste des réglages
-  du pane il vivrait dans `$.store`, partagé par toutes les sessions de la
-  machine : une case cochée un mardi autoriserait les écritures du mercredi dans
-  un autre dépôt. L'écriture ne serait plus la conséquence *directe* d'un choix.
-
-Le coût de ce choix est une question par délégation en écriture, et une
-délégation en écriture impossible en `claude -p`. Les tâches en lecture seule,
-elles, ne demandent rien.
+Le coût de ce choix est qu'une délégation en écriture lancée alors que
+l'interrupteur est désarmé ne part pas du premier coup.
 
 ## Installation
 
@@ -331,8 +311,8 @@ cd ~/Documents/Dev-Perso/opencode-delegate && claude plugin validate . --strict 
   une référence git (`origin/main`) et de créer un worktree détaché, pour qu'une
   lecture ne dépende jamais de l'état du checkout de l'opérateur. Écartée :
   - un worktree **écrit dans le `.git` de l'opérateur** (`git worktree add`), ce
-    qui est une écriture de plus, faite sans la question de `$.ui.ask`, et
-    jusque dans une délégation annoncée comme en lecture seule ;
+    qui est une écriture de plus, faite hors de l'interrupteur, et jusque dans
+    une délégation annoncée comme en lecture seule ;
   - il faut le **retirer** après, et le mod n'a précisément aucune garantie de
     tourner jusqu'au bout — un tour abandonné laisserait un worktree orphelin
     dans `git worktree list` à chaque fois, et `git worktree prune` ne le
@@ -377,8 +357,8 @@ cd ~/Documents/Dev-Perso/opencode-delegate && claude plugin validate . --strict 
 ## Limites connues
 
 - Une délégation en écriture est impossible en `claude -p` et dans l'Agent SDK :
-  `$.ui.ask` y rejette, faute de quelqu'un à qui demander. La lecture seule, elle,
-  marche.
+  le pane n'y est pas dessiné, donc personne ne peut armer l'interrupteur, et il
+  se remet à zéro à chaque session. La lecture seule, elle, marche.
 - En lecture seule, la tâche part **sans** `--auto`. Si une configuration locale
   donne à l'agent `plan` un outil qui demande une approbation, opencode attend
   cette approbation que personne ne lui donnera, et la tâche meurt au timeout.

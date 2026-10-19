@@ -26,11 +26,6 @@ const MIN_MAJOR = 2
 // Le preflight bloque le premier prompt, donc il tient en quelques secondes
 const PROBE_MS = 5_000
 
-// Les libelles de la question d'autorisation. `$.ui.ask` rend le libelle choisi
-// tel quel, donc on les compare a l'identique.
-const ALLOW = "Autoriser l'ecriture"
-const READ_ONLY = 'Lecture seule'
-const CANCEL = 'Annuler'
 
 // L'agent opencode en lecture seule, le mode par defaut de toute delegation
 const PLAN_AGENT = 'plan'
@@ -100,17 +95,13 @@ let notice = null
 let folded = { running: false, done: false }
 // Quelles cartes montrent le detail de leurs appels d'outils
 let openCalls = {}
+// L'ecriture est-elle armee ? Volontairement au niveau module, donc remise a
+// faux a chaque session : garder l'interrupteur arme d'une session a l'autre
+// ferait d'un geste explicite une permission permanente, ce qui n'est plus un
+// interrupteur. Il se bascule dans le pane, a cote du selecteur de modele.
+let writeArmed = false
 // Ce que le preflight a trouve ; `reason` est deja une phrase pour l'utilisateur
 let opencode = { isReady: false, version: null, reason: "opencode n'a pas encore ete sonde" }
-// Quand la question d'autorisation d'ecriture en cours a ete posee, 0 s'il n'y
-// en a pas. Le moteur ne tient qu'un AskUserQuestion a la fois : deux `$.ui.ask`
-// lances coup sur coup, et le second revient en refus sans que personne ait rien
-// refuse. Une date plutot qu'un booleen parce qu'un hook tue en pleine question
-// ne remet rien a zero : au-dela de STALE_ASK_MS le drapeau est tenu pour
-// perime, sinon une seule tache morte interdirait l'ecriture pour tout le
-// processus.
-let askingSince = 0
-const STALE_ASK_MS = 900_000
 
 // Sonde `opencode --version` avant d'enregistrer quoi que ce soit. `$.process.run`
 // rejette si le binaire ne demarre pas, d'ou le try/catch ; un code de sortie non
@@ -478,13 +469,11 @@ export function register(on) {
           "Par defaut la tache part en LECTURE SEULE (agent `plan` d'opencode) :",
           'opencode lit le depot et rend un compte rendu, mais ne modifie aucun',
           'fichier. Pour une tache qui doit ecrire, passer `writeFiles: true` :',
-          "l'utilisateur est alors interroge et doit autoriser l'ecriture lui-meme,",
-          "sans quoi la delegation n'a pas lieu. Ne pas passer `writeFiles` pour",
-          'une tache dont le perimetre de fichiers est flou.',
-          'Une seule delegation en ecriture a la fois : le moteur ne tient',
-          "qu'une question a la fois, donc deux appels `writeFiles` dans le meme",
-          'tour font refuser le second. Les delegations en lecture seule, elles,',
-          'peuvent partir en parallele.',
+          "la delegation ne part que si l'utilisateur a arme l'ecriture dans le",
+          'pane `/opencode`, un interrupteur qui se desarme a chaque nouvelle',
+          'session. Si elle ne l\'est pas, rien ne tourne et le resultat le dit :',
+          "le demander a l'utilisateur plutot que de reessayer. Ne pas passer",
+          '`writeFiles` pour une tache dont le perimetre de fichiers est flou.',
           "L'outil rend la reponse finale d'opencode, plus l'id de session a passer",
           'dans `resume` pour un suivi sur la meme conversation opencode, le',
           'repertoire ou la tache a tourne et le commit de depart.',
@@ -506,7 +495,7 @@ export function register(on) {
             writeFiles: {
               type: 'boolean',
               description:
-                "A passer a true seulement si la tache doit modifier des fichiers. L'utilisateur est alors interroge et doit autoriser l'ecriture ; s'il refuse ou ne repond pas, rien ne part. Sans ce champ, la tache tourne en lecture seule. Une seule a la fois : un second appel avec `writeFiles` pendant qu'une question attend est refuse d'office.",
+                "A passer a true seulement si la tache doit modifier des fichiers, et seulement si l'utilisateur a arme l'ecriture dans le pane `/opencode`. Sinon rien ne part. Sans ce champ, la tache tourne en lecture seule, ce qui est le defaut.",
             },
             model: {
               type: 'string',
@@ -588,11 +577,10 @@ export function register(on) {
         '',
         "Par defaut la delegation est en lecture seule : opencode lit le depot et",
         "rend un compte rendu, sans toucher aux fichiers. Pour une tache qui doit",
-        'ecrire, passer `writeFiles: true` : la question part a l\'utilisateur, qui',
-        "autorise ou non ; sans son accord, rien ne tourne. Ne pas le passer pour",
-        'une tache dont le perimetre de fichiers est flou. Une seule delegation en',
-        'ecriture a la fois : deux questions lancees dans le meme tour font refuser',
-        'la seconde.',
+        "ecrire, passer `writeFiles: true` : elle ne part que si l'utilisateur a",
+        "arme l'ecriture dans le pane `/opencode`. Sinon rien ne tourne, et il faut",
+        'le lui demander. Ne pas le passer pour une tache dont le perimetre de',
+        'fichiers est flou.',
         '',
         "Le resultat nomme le repertoire effectif, le commit de depart et l'etat du",
         "checkout. Quand la tache est coupee, il dit pourquoi et rend quand meme ce",
@@ -624,48 +612,22 @@ export function register(on) {
     }
 
     // L'ecriture n'est jamais implicite : Claude la demande, l'utilisateur la
-    // donne. `$.ui.ask` rejette si la question est ecartee et dans un `claude -p`,
     // ou personne ne peut repondre ; dans les deux cas rien ne part.
-    let mayWrite = false
-    if (e.writeFiles) {
-      // Le moteur ne tient qu'un AskUserQuestion a la fois. Deux delegations en
-      // ecriture lancees dans le meme tour, et la seconde question revient en
-      // refus sans que personne ait rien refuse : on la refuse nous-memes, en
-      // disant quoi faire, plutot que de laisser Claude lire un faux « non ».
-      if (askingSince && Date.now() - askingSince < STALE_ASK_MS) {
-        return {
-          result:
-            "Une autre delegation attend deja que l'utilisateur autorise l'ecriture, et le moteur ne tient " +
-            "qu'une question a la fois. Rien ne s'est execute. Une seule delegation en ecriture a la fois : " +
-            'attendre le resultat de la premiere, puis rappeler cet outil.',
-        }
-      }
-      const where = e.dir ? ' dans ' + e.dir : ''
-      let answer
-      askingSince = Date.now()
-      try {
-        answer = await $.ui.ask(
-          'Laisser opencode ecrire dans les fichiers' + where + ' pour « ' + fit(prompt, 80) + ' » ?',
-          { options: [ALLOW, READ_ONLY, CANCEL], header: 'opencode' },
-        )
-      } catch (err) {
-        askingSince = 0
-        return {
-          result:
-            "La delegation demandait d'ecrire dans les fichiers, et personne n'a pu l'autoriser (" +
-            err.message +
-            '). Rien ne s\'est execute. Relancer sans `writeFiles` pour une tache en lecture seule.',
-        }
-      }
-      askingSince = 0
-      if (answer === ALLOW) mayWrite = true
-      else if (answer !== READ_ONLY) {
-        return {
-          result:
-            "L'utilisateur n'a pas autorise l'ecriture (reponse : " +
-            answer +
-            "). Rien ne s'est execute.",
-        }
+    // opencode tourne avec `--auto` : ses ecritures ne passent ni par le mode
+    // auto de Claude Code, ni par les regles de permission, parce qu'elles ont
+    // lieu dans un sous-processus. L'interrupteur du pane est donc le seul
+    // point de controle humain entre un prompt ecrit par un modele et les
+    // fichiers du depot.
+    const mayWrite = Boolean(e.writeFiles) && writeArmed
+    if (e.writeFiles && !writeArmed) {
+      await $.ui.open({ id: PANE, title: 'opencode' })
+      $.ui.toast("opencode: l'ecriture est desarmee")
+      return {
+        result:
+          "L'ecriture n'est pas armee : rien ne s'est execute. L'utilisateur arme l'ecriture lui-meme, " +
+          "dans le pane `/opencode`, avec l'interrupteur a cote du selecteur de modele ; il se desarme a " +
+          'chaque nouvelle session. Lui demander de l\'armer, puis rappeler cet outil. Sans ecriture, la ' +
+          'meme tache tourne en lecture seule en retirant `writeFiles`.',
       }
     }
     // Une session reprise existe deja, avec le repertoire ou elle est nee ; une
@@ -982,6 +944,20 @@ export function register(on) {
       },
     })
 
+    // L'etat de l'ecriture est toujours visible, et se bascule d'un clic : c'est
+    // le seul point de controle entre un prompt ecrit par un modele et les
+    // fichiers du depot, il ne doit pas etre cache dans un menu
+    const writeSwitch = Button({
+      key: 'write-toggle',
+      label: writeArmed ? 'Ecriture  armee' : 'Ecriture  desarmee',
+      plain: true,
+      dimColor: !writeArmed,
+      onPress: () => {
+        writeArmed = !writeArmed
+        redraw()
+      },
+    })
+
     const header = Box({
       key: 'header',
       flexDirection: 'column',
@@ -989,6 +965,7 @@ export function register(on) {
       children: [
         picker,
         field,
+        writeSwitch,
         ...(notice ? [Text({ key: 'notice', color: 'red', children: [fit(notice, width)] })] : []),
       ],
     })
