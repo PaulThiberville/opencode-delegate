@@ -391,7 +391,7 @@ test('sans titre, la carte ne retombe pas sur le prompt', async ($, on) => {
   await ui.unmount()
 })
 
-test('la bordure des cartes est neutre, le statut tient dans le glyphe', async ($, on) => {
+test("la carte est neutre, et un echec se signale par son titre en rouge", async ($, on) => {
   const clock = mock.clock(on)
   mock.env(on, {})
   stubEngine(on, clock, new Map())
@@ -402,8 +402,12 @@ test('la bordure des cartes est neutre, le statut tient dans le glyphe', async (
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const card: any = await ui.find({ key: 'task-1' })
   expect(card.props.borderColor).toBe('gray')
-  // le glyphe reste colore : c'est lui qui separe un echec d'une reussite
-  expect(await ui.find({ type: 'Text', text: '✓' })).toBeDefined()
+  // plus de glyphe devant le modele
+  expect(await ui.find({ type: 'Text', text: '✓' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: '▸' })).toBeUndefined()
+  // une tache qui a abouti garde son titre de la couleur du texte
+  const ok: any = await ui.find({ type: 'Text', text: 'Lecture de a.txt' })
+  expect(ok.props.color).toBeUndefined()
   await ui.unmount()
 })
 
@@ -450,4 +454,85 @@ test('la carte montre les tokens et deplie ses appels', async ($, on) => {
     expect(await ui.find({ type: 'Text', text: 'read a.txt' })).toBeUndefined()
     await ui.unmount()
   }
+})
+
+test('les appels apparaissent pendant que la tache tourne', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  stubEngine(on, clock, new Map())
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  const pending = $.tool.call({ tool: TOOL, prompt: 'Lis a.txt' })
+  // deux tours de suivi : le second relit le journal de la session
+  await clock.advance(4000)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const button: any = await ui.find({ key: 'calls-1' })
+  expect(button.props.label).toContain('2 appels')
+  // le flux de `opencode run` n'a encore rien rendu, mais la session, si
+  await ui.press({ key: 'calls-1' })
+  // un outil qui n'a pas abouti porte son statut dans le libelle
+  expect(await ui.find({ type: 'Text', text: 'grep (error)' })).toBeDefined()
+  await ui.unmount()
+
+  await clock.advance(2000)
+  await pending
+})
+
+
+test('une tache en echec porte son titre en rouge', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  const saved = new Map<string, unknown>()
+  on('tool.register', () => ({ value: undefined }))
+  on('command.register', () => ({ value: undefined }))
+  on('session.start', () => ({ cwd: '/work' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.log', () => ({ value: undefined }))
+  on('ui.render', () => ({ type: 'Text', props: {}, children: ['dessine par le moteur'] }))
+  on('session.cwd', () => ({ value: '/work' }))
+  on('store.get', ($: any, e: any) => ({ value: saved.get(e.key) }))
+  on('store.set', () => ({ value: undefined }))
+  on('process.run', ($: any, e: any) => {
+    const argv: string[] = e.argv
+    // sans cette reponse, le preflight conclut qu'opencode manque et l'outil
+    // n'est jamais enregistre
+    if (argv[1] === '--version') return { value: { exitCode: 0, stdout: 'opencode v2.0.32', stderr: '' } }
+    if (argv[0] === 'pwd') return { value: { exitCode: 0, stdout: '/work\n', stderr: '' } }
+    if (argv[0] === 'git') return { value: { exitCode: 0, stdout: 'abc123def456\nmain\n', stderr: '' } }
+    if (argv[1] === 'models') return { value: { exitCode: 0, stdout: CATALOG, stderr: '' } }
+    if (argv[2] === 'session.list') {
+      return {
+        value: {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            data: [{ id: SERVER_SID, time: { created: Date.now() }, location: { directory: '/work' } }],
+          }),
+          stderr: '',
+        },
+      }
+    }
+    if (argv[1] === 'api') return { value: { exitCode: 0, stdout: SESSION_GET, stderr: '' } }
+    // la tache elle-meme echoue
+    return {
+      value: {
+        exitCode: 1,
+        stdout:
+          '{"type":"error","timestamp":1,"sessionID":"SID","error":{"type":"provider.auth","message":"This API key has expired."}}',
+        stderr: '',
+      },
+    }
+  })
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await $.tool.call({ tool: TOOL, prompt: 'Lis a.txt' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'dessine par le moteur' })).toBeUndefined()
+  // le titre porte l'echec, puisqu'il n'y a plus de glyphe pour le dire
+  // le titre porte l'echec, puisqu'il n'y a plus de glyphe pour le dire
+  const title: any = await ui.find({ type: 'Text', text: /gpt-oss:20b|Lecture de a.txt/ })
+  expect(title.props.color).toBe('red')
+  await ui.unmount()
 })

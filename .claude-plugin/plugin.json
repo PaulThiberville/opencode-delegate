@@ -1,6 +1,6 @@
 {
   "name": "opencode-delegate",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Delegue des taches a opencode 2 comme sous-agent, avec un pane de suivi",
   "author": {
     "name": "Paul Thiberville"

@@ -282,8 +282,22 @@ async function recoverPartial($, sessionId) {
         text = part.text.trim() || null
       } else if (part.type === 'tool') {
         const name = part.name || part.tool
-        const status = (part.state || {}).status
-        if (name) mine.push(status && status !== 'completed' ? name + ' (' + status + ')' : name)
+        const state = part.state || {}
+        const time = state.time || {}
+        // meme forme que les appels lus dans le flux, pour que la carte n'ait
+        // pas deux sortes d'appels a dessiner
+        if (name) {
+          mine.push({
+            tool: name,
+            status: state.status || 'unknown',
+            // un outil qui n'a pas abouti le dit dans son libelle : la carte
+            // comme le compte rendu rendu a Claude le montrent alors
+            title:
+              (state.title || name) +
+              (state.status && state.status !== 'completed' ? ' (' + state.status + ')' : ''),
+            ms: time.start && time.end ? time.end - time.start : null,
+          })
+        }
       }
     }
     if (mine.length) groups.push(mine)
@@ -370,6 +384,7 @@ function tokens(task) {
 
 // Fin du segment en cours : c'est lui qui alimente la duree cumulee
 function closeSegment(task) {
+  task.liveCalls = null
   const segments = task.segments || []
   const last = segments[segments.length - 1]
   if (last && !last.endedAt) last.endedAt = Date.now()
@@ -701,6 +716,10 @@ export function register(on) {
     $.ui.invalidate('ui.render')
 
     let watched = sessionId
+    // Le journal des outils se relit dans la session, pas dans le flux : celui
+    // de `opencode run` n'arrive qu'a la sortie du processus. On espace cette
+    // relecture, plus lourde qu'un `session.get`, un tour sur deux.
+    let tick = 0
     const poll = $.clock.every(POLL_MS, async () => {
       if (!watched) {
         // la session nait au premier evenement du run, pas avant
@@ -721,6 +740,12 @@ export function register(on) {
         if (info.title) task.title = info.title
       } catch {
         // la session n'existe pas encore, ou le service repond mal : on reessaie
+      }
+      if (++tick % 2 === 0) {
+        const live = await recoverPartial($, watched)
+        // la session porte le journal de tous ses segments : il remplace la
+        // liste courante au lieu de s'y ajouter
+        if (live && live.tools.length) task.liveCalls = live.tools
       }
       $.ui.invalidate('ui.render')
     })
@@ -812,7 +837,7 @@ export function register(on) {
         body.push('', "La session d'opencode ne garde aucun texte : il n'avait rien conclu avant l'arret.")
       }
       if (partial && partial.tools.length) {
-        body.push('', 'Outils appeles avant l\'arret : ' + partial.tools.join(', '))
+        body.push('', 'Outils appeles avant l\'arret : ' + partial.tools.map((call) => call.title).join(', '))
       }
       body.push('', resumeLine())
       body.push('', '---', footer(), whereLine)
@@ -980,12 +1005,10 @@ export function register(on) {
     // partout pour que seule la couleur distingue les etats
     const card = (task) => {
       const isRunning = task.status === 'running'
-      const mark = isRunning ? '\u25b8' : task.status === 'done' ? '\u2713' : '\u2717'
-      // La bordure est neutre, comme dans le panneau des taches en arriere-plan :
-      // le statut tient dans le glyphe et dans la section qui porte la carte.
-      // Le glyphe garde sa couleur, seul signe qui distingue un echec d'une
-      // reussite dans la liste des terminees.
-      const color = isRunning ? 'blue' : task.status === 'done' ? 'green' : 'red'
+      // Ni bordure coloree ni glyphe : la section dit deja si la tache tourne,
+      // et le seul etat qui doit sauter aux yeux est l'echec. Il passe donc par
+      // le titre, en rouge.
+      const failed = task.status === 'failed'
       const model = shortModel(task.model)
       // La duree de la session entiere, et rien d'autre : le budget restant ne
       // fait qu'inquieter, puisqu'une coupure se reprend par `resume`
@@ -1002,7 +1025,9 @@ export function register(on) {
         .filter(Boolean)
         .join('  ')
 
-      const calls = task.toolCalls || []
+      // En cours, le journal vient de la session et couvre tous ses segments ;
+      // finie, c'est la liste accumulee qui fait foi
+      const calls = (isRunning ? task.liveCalls : null) || task.toolCalls || []
       const isOpen = openCalls[task.id]
       const history = [
         calls.length + (calls.length > 1 ? ' appels' : ' appel'),
@@ -1047,18 +1072,14 @@ export function register(on) {
             justifyContent: 'space-between',
             columnGap: 1,
             children: [
-              Text({ children: [fit(head, Math.max(inner - time.length - 2, 8))] }),
+              Text({
+                color: failed ? 'red' : undefined,
+                children: [fit(head, Math.max(inner - time.length - 2, 8))],
+              }),
               Text({ dimColor: true, children: [time] }),
             ],
           }),
-          Box({
-            flexDirection: 'row',
-            columnGap: 1,
-            children: [
-              Text({ color, children: [mark] }),
-              Text({ dimColor: true, children: [fit(meta, inner - 2)] }),
-            ],
-          }),
+          Text({ dimColor: true, children: [fit(meta, inner)] }),
           ...(calls.length
             ? [
                 Button({

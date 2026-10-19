@@ -38,10 +38,10 @@ Autre   provider/model (458 au catalogue)
 En cours 1 ⌄
 ╭──────────────────────────────────────────╮
 │ Parité clés i18n fr/en apps/mobile  6m02 │
-│ ▸ glm-5.3-flash-free  12.4k tokens       │
+│ glm-5.3-flash-free  12.4k tokens         │
 │ 15 appels · 2 reprises · 1 coupure ⌄     │
 │   read taxonomy.ts                  420ms│
-│   grep "t(" apps/mobile                3s│
+│   grep (error)                         3s│
 ╰──────────────────────────────────────────╯
 
 Terminees 3 ›
@@ -61,9 +61,14 @@ tant qu'opencode n'a pas nommé sa session, le modèle prend la place du titre.
 La seconde ligne ne mentionne `ecriture` que lorsque l'écriture a été
 autorisée, la lecture seule étant le défaut, et la cause d'arrêt seulement
 quand il y en a une. La troisième compte les reprises et les coupures, pour
-qu'une session recousue garde la trace de ce qui l'a interrompue. La bordure
-est neutre : le statut tient dans le glyphe et dans la section qui porte la
-carte.
+qu'une session recousue garde la trace de ce qui l'a interrompue. Ni bordure colorée ni glyphe : la section dit déjà si la tâche
+tourne, et le seul état qui doit sauter aux yeux est l'échec — il passe donc
+par le titre, en rouge.
+
+Le journal des appels se remplit **pendant** que la tâche tourne : il est relu
+dans la session opencode toutes les deux rondes de suivi, parce que le flux de
+`opencode run`, lui, n'arrive qu'à la sortie du processus. Un outil qui n'a pas
+abouti porte son statut dans son libellé (`grep (error)`).
 
 Une tâche mal arrêtée porte en seconde ligne **la cause** de son arrêt
 (`budget`, `abandon`, `fournisseur`, `erreur`, `demarrage`).
