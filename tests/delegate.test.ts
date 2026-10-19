@@ -273,3 +273,19 @@ test('sans titre, la carte ne retombe pas sur le prompt', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: 'gpt-oss:20b' })).toBeDefined()
   await ui.unmount()
 })
+
+test('la bordure des cartes est neutre, le statut tient dans le glyphe', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  stubEngine(on, clock, new Map())
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await runTask($, clock)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const card: any = await ui.find({ key: 'task-1' })
+  expect(card.props.borderColor).toBe('gray')
+  // le glyphe reste colore : c'est lui qui separe un echec d'une reussite
+  expect(await ui.find({ type: 'Text', text: '✓' })).toBeDefined()
+  await ui.unmount()
+})

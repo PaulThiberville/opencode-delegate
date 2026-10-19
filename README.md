@@ -28,28 +28,25 @@ Modele  opencode/glm-5.3-flash-free
 
 Autre   provider/model (457 au catalogue)
 
-▾ En cours (1)
+En cours 1 ⌄
 ╭────────────────────────────────────────╮
-│ Refactor du module auth                │
-│ ▸ kimi-k2.7-code  ecriture   1m12  $0.0032│
+│ Refactor du module auth           1m12 │
+│ ▸ kimi-k2.7-code  ecriture  $0.0032    │
 ╰────────────────────────────────────────╯
 
-▸ Terminees (3)
+Terminees 3 ›
 
 4 taches · $0.0043
 ```
 
-Une tâche par carte : le titre qu'opencode a donné à sa session en haut, puis
-le modèle, la portée (`lecture` ou `ecriture`), la durée et le coût. Le début
-du prompt n'est jamais affiché — c'est du transcript, illisible en une ligne.
-Tant qu'opencode n'a pas nommé sa session, la carte n'a que sa seconde ligne.
-Bordure colorée selon le statut : bleu en cours, vert terminé, rouge en échec,
-toutes de la même épaisseur. Chaque carte porte aussi
-ce que la tâche avait le droit de faire, `lecture` ou `ecriture`. Les deux listes se
-plient et se déplient en cliquant leur en-tête, ou avec `e` et `t` quand le
-pane a le focus. `tests/delegate.test.ts`, `tests/permissions.test.ts` et
-`tests/preflight.test.ts` montent le pane sur les trois surfaces et vérifient
-que le moteur n'a pas repris la main, ce qui est le symptôme d'un arbre refusé.
+Une tâche par carte, calquée sur le panneau « tâches en arrière-plan » de
+Claude Code : le titre qu'opencode a donné à sa session et la durée sur la
+première ligne, puis le modèle, la portée (`lecture` ou `ecriture`) et le coût
+en seconde ligne, estompés. Le début du prompt n'est jamais affiché — c'est du
+transcript, illisible en une ligne ; tant qu'opencode n'a pas nommé sa session,
+le modèle prend la place du titre. La bordure est neutre : le statut tient dans
+le glyphe, seul signe qui distingue un échec d'une réussite parmi les terminées,
+et dans la section qui porte la carte.
 
 Le sélecteur **Modele** liste les modèles récents d'abord, puis ceux des mêmes
 fournisseurs, puis le reste du catalogue d'`opencode models`, chargé en tâche

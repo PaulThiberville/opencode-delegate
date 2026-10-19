@@ -604,36 +604,39 @@ export function register(on) {
     const card = (task) => {
       const isRunning = task.status === 'running'
       const mark = isRunning ? '\u25b8' : task.status === 'done' ? '\u2713' : '\u2717'
+      // La bordure est neutre, comme dans le panneau des taches en arriere-plan :
+      // le statut tient dans le glyphe et dans la section qui porte la carte.
+      // Le glyphe garde sa couleur, seul signe qui distingue un echec d'une
+      // reussite dans la liste des terminees.
       const color = isRunning ? 'blue' : task.status === 'done' ? 'green' : 'red'
-      const metrics = [duration(task), money(task.cost)].filter(Boolean).join('  ')
+      const model = shortModel(task.model)
       // Ce que la tache avait le droit de faire, lisible d'un coup d'oeil
       const scope = task.mayWrite ? 'ecriture' : 'lecture'
-      const room = Math.max(inner - metrics.length - scope.length - 3, 8)
+      const time = duration(task)
+      const head = task.title || model
+      const meta = [task.title ? model : null, scope, money(task.cost)].filter(Boolean).join('  ')
       return Box({
         key: 'task-' + task.id,
         flexDirection: 'column',
         borderStyle: 'round',
-        borderColor: color,
+        borderColor: 'gray',
         paddingX: 1,
         children: [
-          // Le titre que opencode donne a sa session, quand il est arrive. Le
-          // debut du prompt ne sert pas de repli : c'est du transcript, illisible
-          // en une ligne et sans interet une fois la tache lancee
-          ...(task.title ? [Text({ children: [fit(task.title, inner)] })] : []),
           Box({
             flexDirection: 'row',
             justifyContent: 'space-between',
+            columnGap: 1,
             children: [
-              Box({
-                flexDirection: 'row',
-                columnGap: 1,
-                children: [
-                  Text({ color, children: [mark] }),
-                  Text({ dimColor: true, children: [fit(shortModel(task.model), room)] }),
-                  Text({ color: task.mayWrite ? 'yellow' : 'cyan', children: [scope] }),
-                ],
-              }),
-              Text({ dimColor: true, children: [metrics] }),
+              Text({ children: [fit(head, Math.max(inner - time.length - 2, 8))] }),
+              Text({ dimColor: true, children: [time] }),
+            ],
+          }),
+          Box({
+            flexDirection: 'row',
+            columnGap: 1,
+            children: [
+              Text({ color, children: [mark] }),
+              Text({ dimColor: true, children: [fit(meta, inner - 2)] }),
             ],
           }),
         ],
@@ -646,7 +649,7 @@ export function register(on) {
       const isFolded = folded[id]
       const head = Button({
         key: 'fold-' + id,
-        label: (isFolded ? '\u25b8 ' : '\u25be ') + label + ' (' + list.length + ')',
+        label: label + ' ' + list.length + ' ' + (isFolded ? '\u203a' : '\u2304'),
         hotkey,
         plain: true,
         onPress: () => {
