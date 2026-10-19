@@ -105,6 +105,13 @@ const STOPS = {
     word: 'erreur',
     line: () => "opencode s'est arrete en erreur pendant la tache.",
   },
+  stopped: {
+    word: 'arrete',
+    line: () =>
+      "L'utilisateur a arrete la delegation depuis le pane `/opencode`. Ce n'est ni un echec d'opencode " +
+      "ni un budget epuise : la tache a ete coupee a la main. Ne pas la relancer de soi-meme ; attendre " +
+      "qu'il redemande, et reprendre avec `resume` s'il le demande.",
+  },
   start: {
     word: 'demarrage',
     line: () =>
@@ -1261,6 +1268,15 @@ async function runDelegation($, spec, next, job) {
   })
   task.runs += 1
   task.segments.push({ startedAt: task.startedAt })
+  // Le bouton d'arret du pane resout cette promesse. On ne peut pas tuer le
+  // processus — `$.process.run` n'en donne aucune prise — alors on la met en
+  // course avec lui : interrompre la session arrete le travail cote serveur,
+  // et cette promesse nous libere de l'attente.
+  let release = null
+  const stopped = new Promise((resolve) => {
+    release = resolve
+  })
+  task.release = release
   // la reprise repasse la carte en tete, et dans « En cours »
   tasks = resumed ? [task, ...tasks.filter((item) => item !== task)] : [task, ...tasks]
   if (job) jobTasks.set(job.key, task)
@@ -1383,14 +1399,25 @@ async function runDelegation($, spec, next, job) {
     isOutOfBudget = true
   })
 
-  let run
-  try {
-    run = await $.process.run(argv, init)
-  } catch (err) {
+  // Le processus contre le bouton : le premier des deux decide. Le resultat
+  // tardif du perdant retombe dans un `then` dont personne ne lit la valeur,
+  // donc une tache arretee ne se termine pas une seconde fois.
+  const outcome = await Promise.race([
+    $.process.run(argv, init).then((value) => ({ value }), (err) => ({ err })),
+    stopped.then(() => ({ isStopped: true })),
+  ])
+  task.release = null
+
+  if (outcome.isStopped) {
+    fuse.cancel()
+    return giveUp('stopped')
+  }
+  if (outcome.err) {
     fuse.cancel()
     const stop = isAbandoned || (next && isAborted(next)) ? 'abandoned' : isOutOfBudget ? 'budget' : 'start'
-    return giveUp(stop, err.message)
+    return giveUp(stop, outcome.err.message)
   }
+  const run = outcome.value
   fuse.cancel()
   poll.cancel()
 
@@ -1995,6 +2022,54 @@ export function register(on) {
         )
       }
 
+      // Arretable seulement quand il y a quelque chose a interrompre : tant que
+      // la session opencode n'a pas ete retrouvee, un clic ne couperait rien et
+      // un bouton mort vaut moins que pas de bouton.
+      const canStop = isRunning && Boolean(task.sessionId) && Boolean(task.release)
+      const controls = [
+        ...(calls.length
+          ? [
+              Button({
+                key: 'calls-' + task.id,
+                label: history + ' ' + (isOpen ? '\u2304' : '\u203a'),
+                plain: true,
+                dimColor: true,
+                onPress: () => {
+                  openCalls[task.id] = !openCalls[task.id]
+                  redraw()
+                },
+              }),
+            ]
+          : []),
+        ...(canStop
+          ? [
+              Button({
+                key: 'stop-' + task.id,
+                label: 'arreter',
+                plain: true,
+                dimColor: true,
+                onPress: async () => {
+                  // une seule fois : le bouton disparait des que la promesse est prise
+                  const free = task.release
+                  task.release = null
+                  redraw()
+                  try {
+                    await $.process.run(
+                      ['opencode', 'api', 'session.interrupt', '--param', 'sessionID=' + task.sessionId],
+                      { timeoutMs: 10_000 },
+                    )
+                  } catch {
+                    // le serveur n'a pas repondu : on cesse d'attendre quand
+                    // meme, en sachant que le travail peut continuer cote
+                    // opencode
+                  }
+                  if (free) free()
+                },
+              }),
+            ]
+          : []),
+      ]
+
       return Box({
         key: 'task-' + task.id,
         flexDirection: 'column',
@@ -2015,21 +2090,8 @@ export function register(on) {
             ],
           }),
           Text({ dimColor: true, children: [fit(meta, inner)] }),
-          ...(calls.length
-            ? [
-                Button({
-                  key: 'calls-' + task.id,
-                  label: history + ' ' + (isOpen ? '\u2304' : '\u203a'),
-                  plain: true,
-                  dimColor: true,
-                  onPress: () => {
-                    openCalls[task.id] = !openCalls[task.id]
-                    redraw()
-                  },
-                }),
-                ...rows,
-              ]
-            : []),
+          ...(controls.length ? [Box({ key: 'controls-' + task.id, flexDirection: 'row', columnGap: 2, children: controls })] : []),
+          ...rows,
         ],
       })
     }
