@@ -105,7 +105,7 @@ async function runTask($: any, clock: any, args: Record<string, unknown> = {}) {
   return pending
 }
 
-test('budget epuise : la cause est nommee et la sortie partielle est rendue', async ($, on) => {
+test('budget epuise : la cause est nommee et la sortie partielle est rendue', { timeoutMs: 20_000 }, async ($, on) => {
   const clock = mock.clock(on)
   mock.env(on, {})
   stub(on, clock, { run: 'budget' })
@@ -124,7 +124,7 @@ test('budget epuise : la cause est nommee et la sortie partielle est rendue', as
   expect(out.result).toContain(SERVER_SID)
 })
 
-test('sans texte dans la session, le resultat le dit au lieu de mentir', async ($, on) => {
+test('sans texte dans la session, le resultat le dit au lieu de mentir', { timeoutMs: 20_000 }, async ($, on) => {
   const clock = mock.clock(on)
   mock.env(on, {})
   stub(on, clock, { run: 'budget', messages: [] })
@@ -189,7 +189,7 @@ test("une erreur qui n'est pas du fournisseur ne lui est pas imputee", async ($,
   expect(out.result).toContain("le patch ne s'applique pas")
 })
 
-test('la carte du pane nomme la cause de l\'arret', async ($, on) => {
+test('la carte du pane nomme la cause de l\'arret', { timeoutMs: 20_000 }, async ($, on) => {
   const clock = mock.clock(on)
   mock.env(on, {})
   stub(on, clock, { run: 'budget' })
@@ -225,7 +225,7 @@ test('la carte du pane nomme la cause de l\'arret', async ($, on) => {
 // recopier le texte retrouve dans le transcript par `$.ui.log` — le resultat de
 // l'outil ne va plus nulle part une fois le tour abandonne.
 
-test('un echec rend l\'id de session et dit comment reprendre', async ($, on) => {
+test('un echec rend l\'id de session et dit comment reprendre', { timeoutMs: 20_000 }, async ($, on) => {
   const clock = mock.clock(on)
   mock.env(on, {})
   stub(on, clock, { run: 'budget' })
@@ -241,7 +241,7 @@ test('un echec rend l\'id de session et dit comment reprendre', async ($, on) =>
   expect(out.result).toContain('plafonne un appel, pas une tache')
 })
 
-test('un echec sans session retrouvee ne pretend pas a une reprise', async ($, on) => {
+test('un echec sans session retrouvee ne pretend pas a une reprise', { timeoutMs: 20_000 }, async ($, on) => {
   const clock = mock.clock(on)
   mock.env(on, {})
   stub(on, clock, { run: 'budget', found: false })

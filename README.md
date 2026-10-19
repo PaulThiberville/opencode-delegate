@@ -8,7 +8,7 @@ Mod Claude Code qui utilise **opencode 2** comme sous-agent.
   que si opencode est en 2.x. Sans ça, rien n'est proposé à Claude.
 - Enregistre un outil `mcp__opencode-delegate__delegate` que Claude peut appeler
   comme un `Task`, avec `prompt`, `writeFiles`, `model`, `agent`, `dir`,
-  `resume`, `budgetMs`.
+  `resume`, `budgetMs`, `background`.
 - Lance `opencode run --format json -m <model>` via
   `$.process.run` (plus `--session <id>` sur un `resume`), en `--agent plan`
   (lecture seule) par défaut, et seulement
@@ -27,6 +27,10 @@ Mod Claude Code qui utilise **opencode 2** comme sous-agent.
 - Quand la tâche s'arrête sans conclure, **dit pourquoi**, rend quand même ce
   qu'opencode avait déjà produit, et rend l'id de session pour reprendre par
   `resume` : voir [Quand la tâche s'arrête mal](#quand-la-tâche-sarrête-mal).
+- Avec `background: true`, rend la main **tout de suite** et ramène le compte
+  rendu plus tard, dans un tour à lui, pour que l'orchestrateur reste disponible
+  pendant qu'opencode travaille : voir
+  [La délégation en arrière-plan](#la-délégation-en-arrière-plan).
 
 ## Le pane
 
@@ -59,8 +63,9 @@ nombre d'appels d'outils, dépliable pour voir chacun avec sa durée. Le début 
 prompt n'est jamais affiché — c'est du transcript, illisible en une ligne ;
 tant qu'opencode n'a pas nommé sa session, le modèle prend la place du titre.
 La seconde ligne ne mentionne `ecriture` que lorsque l'écriture a été
-autorisée, la lecture seule étant le défaut, et la cause d'arrêt seulement
-quand il y en a une. La troisième compte les reprises et les coupures, pour
+autorisée, la lecture seule étant le défaut, `fond` pour une délégation lancée
+en arrière-plan — dire où son résultat va arriver, puisqu'il ne revient pas à
+l'appel —, et la cause d'arrêt seulement quand il y en a une. La troisième compte les reprises et les coupures, pour
 qu'une session recousue garde la trace de ce qui l'a interrompue. Ni bordure colorée ni glyphe : la section dit déjà si la tâche
 tourne, et le seul état qui doit sauter aux yeux est l'échec — il passe donc
 par le titre, en rouge.
@@ -71,7 +76,7 @@ dans la session opencode toutes les deux rondes de suivi, parce que le flux de
 abouti porte son statut dans son libellé (`grep (error)`).
 
 Une tâche mal arrêtée porte en seconde ligne **la cause** de son arrêt
-(`budget`, `abandon`, `fournisseur`, `erreur`, `demarrage`).
+(`budget`, `abandon`, `fournisseur`, `erreur`, `demarrage`, `rechargement`).
 
 Le sélecteur **Modele** liste les modèles récents d'abord, puis ceux des mêmes
 fournisseurs, puis le reste du catalogue d'`opencode models`, chargé en tâche
@@ -119,7 +124,7 @@ ligne d'échec, et, pire, par une ligne d'échec qui ne disait pas *laquelle*.
 
 ### La cause est nommée
 
-Cinq causes, qui ne se traitent pas de la même façon. Le résultat rendu à
+Six causes, qui ne se traitent pas de la même façon. Le résultat rendu à
 Claude s'ouvre sur la phrase qui va avec, et la carte du pane porte le mot :
 
 | Carte | Ce qui s'est passé | Ce que le résultat conseille |
@@ -129,6 +134,7 @@ Claude s'ouvre sur la phrase qui va avec, et la carte du pane porte le mot :
 | `fournisseur` | une erreur `provider.*` dans le flux (clé, quota, modèle) | régler le fournisseur d'abord : relancer à l'identique redonnera la même erreur |
 | `erreur` | opencode s'est arrêté en erreur sur la tâche | lire le détail |
 | `demarrage` | la commande n'a pas pu démarrer, ou est morte bien avant son budget | vérifier l'installation, rien n'a tourné |
+| `rechargement` | le module a été remplacé pendant une délégation **de fond** : son minuteur est mort avec lui | reprendre par `resume`, le travail a sans doute continué |
 
 Les trois premières sont celles qui coûtaient cher à confondre. Elles se
 distinguent par deux signaux différents, et non par le message d'erreur :
@@ -202,6 +208,113 @@ qu'opencode lisait un checkout en retard, sans que personne puisse s'en
 apercevoir. Attention, `git rev-list --count HEAD..@{upstream}` mesure le retard
 sur l'amont **tel que le dernier `fetch` l'a laissé**, pas sur le dépôt distant
 maintenant : le mod ne fetche pas tout seul.
+## La délégation en arrière-plan
+
+Par défaut, l'appel **attend** la fin de la tâche : c'est le bon mode quand
+Claude a besoin de la réponse d'opencode pour raisonner dans le même tour. Mais
+pendant ce temps l'orchestrateur est bloqué, et l'utilisateur avec lui.
+
+`background: true` renverse ça :
+
+```
+delegate({ prompt: "...", background: true })
+  → rend la main immédiatement, avec un accusé qui dit de ne pas attendre
+  → le travail part dans un $.clock.after(0, …), hors de tout événement
+  → la carte du pane vit exactement comme pour une délégation bloquante
+  → à la fin, $.prompt.submit() ramène le compte rendu dans un tour à lui
+```
+
+Le compte rendu différé est **le même** que celui du mode bloquant : réponse
+d'opencode, id de session à repasser dans `resume`, répertoire, commit de départ,
+durée, et la cause quand la tâche s'arrête sans conclure. Il arrive précédé d'une
+phrase qui dit à Claude que c'est un résultat différé, qu'il n'y a rien à
+relancer et que l'outil ne doit pas être rappelé pour cette tâche.
+
+Ce n'est **pas** un changement de défaut, et l'argument s'appelle `background`
+plutôt qu'un nom déjà pris : les arguments de l'outil arrivent à plat sur `e`
+dans un hook `tool.call`, comme `dir`, `resume` et `budgetMs`.
+
+Trois réserves, et ce que le mod en fait.
+
+### 1. Un rechargement du mod tue les minuteurs
+
+Une mise à jour du plugin, un `/reload-plugins`, une perte du worker de hooks :
+le module est remplacé, et `$.clock` « annule ses attentes en cours avec l'ancien
+environnement ». Une délégation de fond en vol perdrait donc son minuteur :
+personne ne notifierait, et sa carte resterait « en cours » à mentir
+indéfiniment.
+
+Le mod ne laisse pas cet état mentir. Au lancement d'un job de fond, il écrit un
+**marqueur durable** dans `$.store` — une clé par session Claude, `bg:<id de
+session>`, parce que le store est partagé entre toutes les sessions. Le marqueur
+suit la tâche : id de session opencode dès qu'elle est retrouvée, état du
+checkout, battement toutes les 30 s pour savoir jusqu'à quand la tâche tournait.
+Il est effacé dès que la tâche conclut.
+
+`session.start` repasse à chaque chargement du module. Le mod y relit les
+marqueurs de **sa** session : ceux qui restent sont des jobs qui tournaient quand
+le module est tombé. Pour chacun, il reconstruit une carte dans le pane avec la
+cause `rechargement` — jamais « en cours » —, relit la session opencode pour
+rendre ce qu'elle avait gardé, et notifie comme une fin normale, avec l'id à
+repasser dans `resume`. Passé le budget du job plus deux minutes, il n'ouvre plus
+un tour pour en parler (la tâche a pu finir toute seule depuis longtemps) : la
+carte et une ligne de transcript suffisent. Au-delà de deux heures, le marqueur
+est périmé et jeté sans un mot. Les marqueurs des autres sessions sont laissés
+tranquilles, sauf abandon de plus de deux heures, qui fait le ménage.
+
+Ce balayage tourne **dans** le hook de démarrage, avant que l'outil ne soit
+enregistré, et pas dans un minuteur : sinon une délégation lancée pendant le
+balayage écrirait son marqueur dans la même clé et serait prise pour un orphelin.
+C'est arrivé, et un test couvre le cas. Le compte rendu, lui, part hors de
+l'événement — notifier attend que la session soit inactive.
+
+**Et le processus `opencode` lancé par `$.process.run` ?** Il n'est pas tué par
+le rechargement. Le `.d.ts` publié ne lie la vie de l'enfant au module que pour
+`$.process.spawn` (« le déchargement du module tue l'enfant ») ; pour `run`, un
+appel one-shot exécuté par l'hôte, il ne dit rien de tel. L'enfant continue donc
+jusqu'à son terme ou son budget, côté hôte, mais **sa sortie ne va plus nulle
+part** : plus personne ne lit son NDJSON. Le travail n'est pas perdu pour autant
+— la session opencode en garde l'historique —, d'où le conseil de reprendre par
+`resume` plutôt que de relancer la tâche depuis le début.
+
+### 2. L'écriture est lue à l'appel, jamais au lancement du job
+
+L'interrupteur du pane est lu dans le hook `tool.call`, et le booléen qui en sort
+est **figé** dans la spécification du job. Un job différé ne relit jamais
+l'interrupteur : sinon une délégation partie en lecture seule se mettrait à
+écrire parce que l'utilisateur a armé l'écriture entre l'appel et le lancement
+effectif, c'est-à-dire sans avoir rien autorisé pour cette tâche-là.
+
+Le refus, quand `writeFiles: true` arrive sur un interrupteur désarmé, reste donc
+immédiat et synchrone, `background` ou pas : rien ne part, et le résultat dit
+quoi faire. Deux tests tiennent les deux sens : armer après coup ne débloque
+rien, et une tâche de fond partie en lecture seule reste en `--agent plan` sans
+`--auto` même si l'interrupteur s'arme pendant qu'elle attend son tour.
+
+Pour la même raison, le répertoire de la session est lu **dans le hook** et non
+dans le job : le `.d.ts` prévient qu'« un minuteur qui survit à son hook lit le
+répertoire de la session » au moment où il tourne, pas celui de l'appel.
+
+### 3. Plusieurs notifications : un seul tour, groupé
+
+`$.prompt.submit` démarre un tour à lui **une fois la session inactive**, et
+résout au démarrage de ce tour, pas à sa fin. Deux délégations de fond qui
+finissent presque ensemble enchaîneraient donc deux tours, le second coupant ce
+que l'utilisateur vient de commencer après avoir lu le premier.
+
+Le mod groupe : un compte rendu prêt entre dans une file, et une fenêtre de
+1,5 s laisse le temps à un voisin de la rejoindre, puis toute la file part dans
+**un seul** `$.prompt.submit`, chaque rapport sous un en-tête
+`=== délégation n/N ===`. Le drain boucle, donc un job qui finit pendant l'attente
+de l'inactivité fera un second tour, groupé de la même façon.
+
+Le choix est pour le groupage et pas pour deux tours parce que les deux comptes
+rendus servent le même raisonnement : Claude a besoin de les voir ensemble, et
+l'utilisateur d'être interrompu une fois plutôt que deux. Si la notification ne
+peut pas entrer (prompt refusé, session qui se ferme), le compte rendu est écrit
+dans le transcript par `$.ui.log` — la seule voie qui reste pour rendre ce qui a
+été payé.
+
 ## Permissions
 
 Toute délégation part en **lecture seule** : `--agent plan`, l'agent read-only
@@ -345,9 +458,14 @@ cd ~/Documents/Dev-Perso/opencode-delegate && claude plugin validate . --strict 
   celui passé dans `dir` : la session appartient déjà à un projet.
 - **`opencode api` plutôt que `$.http.fetch`** : l'API v2 est sous `/api` et
   répond 401 sans jeton ; le CLI gère l'auth.
-- **Noms d'arguments** (`dir`, `resume`, `budgetMs`) choisis pour ne pas risquer
-  de collision avec les champs de l'événement `tool.call`, puisque les arguments
-  de l'outil arrivent à plat sur `e`.
+- **Noms d'arguments** (`dir`, `resume`, `budgetMs`, `background`) choisis pour
+  ne pas risquer de collision avec les champs de l'événement `tool.call`,
+  puisque les arguments de l'outil arrivent à plat sur `e`.
+- **Un job de fond tourne dans `$.clock.after(0, …)`**, pas dans le hook. Un
+  rappel de minuteur tourne hors de tout événement : le hook rend la main tout
+  de suite, et le travail ne consomme pas le budget d'exécution du hook. La
+  contrepartie est que ce rappel meurt avec le module, d'où le marqueur durable
+  décrit dans [La délégation en arrière-plan](#la-délégation-en-arrière-plan).
 - **Pane maison plutôt que sous-agent natif** : faire apparaître la tâche dans
   le panneau « tâches en arrière-plan » demanderait un vrai sous-agent Claude
   qui relaie vers l'outil, soit un tour de modèle en plus par délégation. Le
@@ -369,6 +487,11 @@ de dix minutes, rien ne revient avant.
 La parade est côté usage : lancer les délégations dans des **messages séparés**,
 ou leur donner des budgets comparables. La description de l'outil le dit à
 Claude, pour qu'il cesse de les grouper.
+
+`background: true` dissout le problème quand la réponse n'est pas nécessaire
+dans le tour en cours : chaque appel rend la main tout de suite, donc plus rien
+n'attend personne, et les comptes rendus reviennent au fil des fins — groupés
+quand elles tombent ensemble.
 
 ## Limites connues
 
@@ -392,6 +515,17 @@ Claude, pour qu'il cesse de les grouper.
   droit. À savoir si le mod part un jour dans l'équipe par ce canal.
 - Le pane ne rend rien en `claude -p` ni dans l'Agent SDK.
 - `tasks` grandit sans limite sur la durée de la session.
+- Une délégation de fond **ne peut pas être annulée** : ni le pane ni l'outil
+  n'offrent de bouton pour tuer un `$.process.run` en vol. Elle s'arrête d'elle
+  même à son budget.
+- Le compte rendu de fond entre par `$.prompt.submit`, qui attend que la session
+  soit inactive : si l'utilisateur enchaîne les tours, il peut attendre. Et il
+  n'entre pas du tout là où aucun prompt n'est soumis (`claude -p`, Agent SDK) —
+  le transcript le recueille alors par `$.ui.log`.
+- Le marqueur de job de fond est rangé sous l'id de la session Claude. Une
+  session reprise qui garde le même id et dont un job a été perdu plus de deux
+  heures plus tôt voit son marqueur jeté sans un mot : c'est le compromis assumé
+  contre une archéologie qui réveillerait la session pour rien.
 - La récupération de sortie partielle suppose que la session a été **retrouvée**
   dans `opencode api session.list`. Quand elle ne l'est pas — plusieurs tâches
   démarrées dans le même répertoire à la même seconde, service de fond muet — il
