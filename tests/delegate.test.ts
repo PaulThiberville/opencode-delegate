@@ -19,7 +19,7 @@ const CATALOG = ['ollama-cloud/gpt-oss:20b', 'ollama-cloud/kimi-k2.7-code', 'ope
 // Un id tel que le serveur opencode l'emet ; un id invente fait repondre 403
 // FreeTierError au palier gratuit d'OpenCode Console
 const SERVER_SID = 'ses_eac681071ffewObMBj6e5N7Ykt'
-let createFails = false
+let listFinds = true
 
 // Ce que `opencode --version` repond, et ce que l'utilisateur repond a la
 // question d'autorisation d'ecriture ; chaque test peut les changer
@@ -44,7 +44,7 @@ const PANE = {
 
 // Branche les reponses du moteur et rend de quoi inspecter ce qui s'est passe
 function stubEngine(on: any, clock: any, saved: Map<string, unknown>) {
-  createFails = false
+  listFinds = true
   version = 'opencode v2.0.32'
   askAnswer = ALLOW
   const argvs: string[][] = []
@@ -54,6 +54,7 @@ function stubEngine(on: any, clock: any, saved: Map<string, unknown>) {
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.toast', () => ({ value: undefined }))
   on('ui.log', () => ({ value: undefined }))
+  on('session.cwd', () => ({ value: '/work' }))
   // sert de temoin : si le moteur dessine, c'est que notre arbre a ete refuse
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['dessine par le moteur'] }))
   on('store.get', ($: any, e: any) => ({ value: saved.get(e.key) }))
@@ -72,9 +73,11 @@ function stubEngine(on: any, clock: any, saved: Map<string, unknown>) {
     argvs.push(argv)
     if (argv[1] === '--version') return { value: { exitCode: 0, stdout: version, stderr: '' } }
     if (argv[1] === 'models') return { value: { exitCode: 0, stdout: CATALOG, stderr: '' } }
-    if (argv[2] === 'session.create') {
-      if (createFails) return { value: { exitCode: 1, stdout: '', stderr: 'service injoignable' } }
-      return { value: { exitCode: 0, stdout: JSON.stringify({ data: { id: SERVER_SID } }), stderr: '' } }
+    if (argv[2] === 'session.list') {
+      const items = listFinds
+        ? [{ id: SERVER_SID, time: { created: Date.now() }, location: { directory: '/work' } }]
+        : []
+      return { value: { exitCode: 0, stdout: JSON.stringify({ data: items }), stderr: '' } }
     }
     if (argv[1] === 'api') return { value: { exitCode: 0, stdout: SESSION_GET, stderr: '' } }
     // la tache elle-meme prend cinq secondes de temps simule
@@ -195,55 +198,47 @@ test("un echec d'opencode est rendu comme un resultat lisible", async ($, on) =>
   expect(out.result).toContain('This API key has expired.')
 })
 
-test("la session est creee par opencode, jamais inventee", async ($, on) => {
+test("la session est creee par opencode run, pas par l'API", async ($, on) => {
   const clock = mock.clock(on)
   mock.env(on, {})
   const argvs = stubEngine(on, clock, new Map())
-
-  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
-  await runTask($, clock)
-
-  // le palier gratuit refuse un id que le serveur n'a pas emis
-  expect(argvs.some((argv) => argv[2] === 'session.create')).toBe(true)
-  const run = argvs.find((argv) => argv[1] === 'run')
-  expect(run!.join(' ')).toContain('--session ' + SERVER_SID)
-})
-
-test("sans creation de session, la tache part quand meme et l'id vient du flux", async ($, on) => {
-  const clock = mock.clock(on)
-  mock.env(on, {})
-  const argvs = stubEngine(on, clock, new Map())
-  createFails = true
 
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
   const out: any = await runTask($, clock)
 
+  // une session creee par l'API se verrait imposer le repertoire du service,
+  // donc on laisse `opencode run` creer la sienne, ou le cwd est honore
+  expect(argvs.some((argv) => argv[2] === 'session.create')).toBe(false)
   const run = argvs.find((argv) => argv[1] === 'run')
   expect(run!.join(' ')).not.toContain('--session')
-  // l'id lu dans les evenements NDJSON prend le relais
-  expect(out.result).toContain('session opencode: SID')
+  // puis on la retrouve pour alimenter le suivi live
+  expect(argvs.some((argv) => argv[2] === 'session.list')).toBe(true)
+  expect(out.result).toContain('session opencode: ' + SERVER_SID)
 })
 
-test('chaque liste de taches se plie et se deplie', async ($, on) => {
+test("session introuvable dans la liste, l'id vient du flux", async ($, on) => {
   const clock = mock.clock(on)
   mock.env(on, {})
   stubEngine(on, clock, new Map())
+  listFinds = false
 
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
-  await runTask($, clock, { model: 'ollama-cloud/gpt-oss:20b' })
+  const out: any = await runTask($, clock)
 
-  for (const surface of ['terminal', 'desktop', 'vscode'] as const) {
-    const ui = await $.ui.mount({ ...PANE, surface })
-    // la tache est finie, donc elle est dans la section Terminees, depliee
-    expect(await ui.find({ type: 'Text', text: 'gpt-oss:20b' })).toBeDefined()
+  // la tache aboutit quand meme ; seul le suivi live a manque
+  expect(out.result).toContain('hello')
+  expect(out.result).toContain('session opencode: SID')
+})
 
-    await ui.press({ key: 'fold-done' })
-    // l'en-tete reste, la carte disparait
-    expect(await ui.find({ key: 'fold-done' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'gpt-oss:20b' })).toBeUndefined()
+test('une reprise garde sa session et ne la cherche pas', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  const argvs = stubEngine(on, clock, new Map())
 
-    await ui.press({ key: 'fold-done' })
-    expect(await ui.find({ type: 'Text', text: 'gpt-oss:20b' })).toBeDefined()
-    await ui.unmount()
-  }
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await runTask($, clock, { resume: SERVER_SID })
+
+  const run = argvs.find((argv) => argv[1] === 'run')
+  expect(run!.join(' ')).toContain('--session ' + SERVER_SID)
+  expect(argvs.some((argv) => argv[2] === 'session.list')).toBe(false)
 })

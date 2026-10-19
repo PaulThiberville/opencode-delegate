@@ -181,16 +181,21 @@ cd ~/Documents/Dev-Perso/opencode-delegate && claude plugin validate . --strict 
   dix minutes ; le suivi live vient donc du polling, pas du flux. Si `spawn`
   existe dans le build installé, c'est l'axe d'amélioration : on lirait les
   événements NDJSON au fil de l'eau.
-- **Session créée par le serveur, pas inventée.** `--session` accepte un id
-  inexistant et le crée, ce qui serait le plus simple pour connaître l'id avant
-  la fin du run. Mais le palier **gratuit** d'OpenCode Console lit un id qu'il
-  n'a pas émis comme un appel « hors d'OpenCode » et répond `403 FreeTierError`
-  (« OpenCode's free tier can only be used from within OpenCode »), sur
-  `big-pickle`, `glm-5.3-flash-free` et les autres. Le mod appelle donc
-  `opencode api session.create` d'abord : id authentique, et on le connaît quand
-  même avant le run, donc le suivi live est conservé. Si cette création échoue,
-  la tâche part sans `--session` et l'id est lu dans le flux à la fin, au prix
-  du suivi live.
+- **La session est créée par `opencode run`, pas par l'API.** Deux contraintes
+  se contredisent. Le palier **gratuit** d'OpenCode Console lit un id de session
+  qu'il n'a pas émis comme un appel « hors d'OpenCode » et répond
+  `403 FreeTierError` — donc pas d'id inventé. Mais une session créée par
+  `opencode api session.create` se voit imposer le répertoire du **service de
+  fond**, celui d'où il a démarré : la tâche lit et écrit là, pas dans le
+  projet, et `dir` reste sans effet. Ni un champ `directory` dans le corps, ni
+  un paramètre de requête, ni un en-tête ne le changent. Le mod laisse donc
+  `opencode run` créer sa session, où le cwd est honoré, puis la retrouve par
+  `opencode api session.list` — la plus récente créée après le départ de la
+  tâche, dans le répertoire visé — pour alimenter le suivi live. Si elle n'est
+  pas retrouvée, la tâche aboutit quand même et l'id est lu dans le flux à la
+  fin ; seul le suivi live manque.
+- **Une reprise (`resume`) garde le répertoire de la session d'origine**, pas
+  celui passé dans `dir` : la session appartient déjà à un projet.
 - **`opencode api` plutôt que `$.http.fetch`** : l'API v2 est sous `/api` et
   répond 401 sans jeton ; le CLI gère l'auth.
 - **Noms d'arguments** (`dir`, `resume`, `budgetMs`) choisis pour ne pas risquer

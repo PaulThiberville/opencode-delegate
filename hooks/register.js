@@ -96,20 +96,29 @@ async function probeOpencode($) {
 // Ce que l'utilisateur doit faire, quand l'outil n'a pas ete enregistre
 const FIX = 'Installer opencode 2.x (https://opencode.ai), puis relancer la session.'
 
-// Le palier gratuit d'OpenCode Console refuse une session dont l'id n'a pas ete
-// emis par opencode : il lit un id invente comme un appel « hors d'OpenCode »
-// et repond 403 FreeTierError. On fait donc creer la session par le serveur,
-// ce qui donne un id authentique tout en le connaissant avant le run.
-async function createSession($, title) {
+// Deux contraintes se contredisent. Le palier gratuit d'OpenCode Console
+// refuse une session dont l'id n'a pas ete emis par opencode : il lit un id
+// invente comme un appel « hors d'OpenCode » et repond 403 FreeTierError. Mais
+// une session creee par l'API se voit imposer le repertoire du service de fond,
+// celui d'ou il a demarre : la tache lirait et ecrirait la, pas dans le projet,
+// et `dir` serait sans effet (ni le corps, ni un parametre, ni un en-tete ne
+// le changent). On laisse donc `opencode run` creer sa session, ou le cwd est
+// honore, et on la retrouve ensuite pour alimenter le suivi live.
+async function findSession($, since, dir) {
   try {
-    const made = await $.process.run(
-      ['opencode', 'api', 'session.create', '-d', JSON.stringify({ title })],
-      { timeoutMs: 15_000 },
-    )
-    if (made.exitCode !== 0) return null
-    const body = JSON.parse(made.stdout)
-    const info = body.data || body
-    return typeof info.id === 'string' && info.id ? info.id : null
+    const listed = await $.process.run(['opencode', 'api', 'session.list'], { timeoutMs: 10_000 })
+    if (listed.exitCode !== 0) return null
+    const body = JSON.parse(listed.stdout)
+    const items = body.data || body
+    if (!Array.isArray(items)) return null
+    // la liste vient de la plus recente a la plus ancienne
+    const match = items.find((item) => {
+      const created = item && item.time && item.time.created
+      if (typeof created !== 'number' || created < since) return false
+      if (!dir) return true
+      return ((item.location || {}).directory || null) === dir
+    })
+    return match && typeof match.id === 'string' ? match.id : null
   } catch {
     return null
   }
@@ -389,9 +398,18 @@ export function register(on) {
         }
       }
     }
-    // Sans id, la tache tourne quand meme : on le lira dans le flux a la fin,
-    // au prix du suivi live
-    const sessionId = e.resume || (await createSession($, prompt.slice(0, 60)))
+    // Une session reprise existe deja, avec le repertoire ou elle est nee ; une
+    // nouvelle sera creee par `opencode run` lui-meme, puis retrouvee
+    const sessionId = e.resume || null
+    // Sur quoi reconnaitre la session a suivre : le repertoire vise, quand on
+    // peut le nommer en absolu
+    let targetDir = null
+    try {
+      const base = await $.session.cwd()
+      targetDir = !e.dir ? base || null : e.dir.startsWith('/') ? e.dir : null
+    } catch {
+      targetDir = null
+    }
 
     // En lecture seule, l'agent `plan` est impose : un `agent` libre choisi par
     // Claude rouvrirait l'ecriture par la porte de derriere
@@ -416,10 +434,17 @@ export function register(on) {
     await $.ui.open({ id: PANE, title: 'opencode' })
     $.ui.invalidate('ui.render')
 
-    const poll = !sessionId ? null : $.clock.every(POLL_MS, async () => {
+    let watched = sessionId
+    const poll = $.clock.every(POLL_MS, async () => {
+      if (!watched) {
+        // la session nait au premier evenement du run, pas avant
+        watched = await findSession($, task.startedAt - 2_000, targetDir)
+        if (!watched) return
+        task.sessionId = watched
+      }
       try {
         const probe = await $.process.run(
-          ['opencode', 'api', 'session.get', '--param', 'sessionID=' + sessionId],
+          ['opencode', 'api', 'session.get', '--param', 'sessionID=' + watched],
           { timeoutMs: 10_000 },
         )
         if (probe.exitCode !== 0) return
@@ -439,7 +464,7 @@ export function register(on) {
     // lecture seule, l'agent `plan` n'a pas d'outil d'ecriture et rien a approuver.
     const argv = ['opencode', 'run', '--format', 'json', '-m', model]
     if (mayWrite) argv.push('--auto')
-    if (sessionId) argv.push('--session', sessionId)
+    if (e.resume) argv.push('--session', e.resume)
     if (agent) argv.push('--agent', agent)
     argv.push(task.prompt)
 
@@ -450,7 +475,7 @@ export function register(on) {
     try {
       run = await $.process.run(argv, init)
     } catch (err) {
-      if (poll) poll.cancel()
+      poll.cancel()
       task.status = 'failed'
       task.endedAt = Date.now()
       task.error = err.message
@@ -458,7 +483,7 @@ export function register(on) {
       $.ui.toast('opencode: echec')
       return { result: "opencode n'a pas pu finir la tache: " + err.message }
     }
-    if (poll) poll.cancel()
+    poll.cancel()
 
     const parsed = parseEvents(run.stdout)
     task.endedAt = Date.now()
