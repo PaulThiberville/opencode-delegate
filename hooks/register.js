@@ -450,7 +450,9 @@ export function register(on) {
           "Quand la tache s'arrete sans conclure, le resultat dit pourquoi",
           '(budget epuise, tour abandonne, erreur de fournisseur, demarrage',
           "impossible) et rend quand meme ce qu'opencode avait deja produit,",
-          'relu dans sa session.',
+          "relu dans sa session, plus l'id a repasser dans `resume` pour",
+          'reprendre la. Le budget plafonne un appel, pas une tache : une tache',
+          'longue se mene en plusieurs reprises sur la meme session opencode.',
         ].join(' '),
         inputSchema: {
           type: 'object',
@@ -735,8 +737,21 @@ export function register(on) {
         .filter(Boolean)
         .join(' · ')
 
+    // Le plafond de dix minutes porte sur un appel de `$.process.run`, pas sur
+    // une tache : la session opencode, elle, garde son historique. Un echec qui
+    // ne rend pas son id casse la chaine — Claude n'a plus de quoi reprendre, et
+    // une tache longue a l'air hors de portee du mod alors qu'elle se mene en
+    // plusieurs reprises. On le dit donc explicitement, et on dit aussi quand il
+    // n'y a pas d'id, pour ne pas laisser croire a une reprise possible.
+    const resumeLine = () =>
+      task.sessionId
+        ? 'Reprise possible : rappeler cet outil avec `resume: "' +
+          task.sessionId +
+          '"` continue dans la meme session opencode, qui garde tout son historique. Le budget plafonne un appel, pas une tache : une tache longue se mene en plusieurs reprises.'
+        : "Pas de reprise possible : la session opencode n'a pas ete retrouvee, donc pas d'id a passer dans `resume`. Il faudrait relancer la tache depuis le debut."
+
     // Ce qui est rendu quand la tache s'arrete sans conclusion : la cause, ce
-    // qu'opencode avait deja produit, et ou ca a tourne
+    // qu'opencode avait deja produit, ou ca a tourne, et comment reprendre
     const giveUp = async (stop, detail) => {
       poll.cancel()
       task.status = 'failed'
@@ -764,6 +779,7 @@ export function register(on) {
       if (partial && partial.tools.length) {
         body.push('', 'Outils appeles avant l\'arret : ' + partial.tools.join(', '))
       }
+      body.push('', resumeLine())
       body.push('', '---', footer(), whereLine)
       if (behindLine) body.push(behindLine)
 
@@ -823,6 +839,7 @@ export function register(on) {
       $.ui.toast('opencode: ' + STOPS[task.stop].word + ' en ' + duration(task))
       const body = [STOPS[task.stop].line(task), 'Detail : ' + why]
       if (parsed.text) body.push('', "Ce qu'opencode avait produit avant l'erreur :", '', parsed.text)
+      body.push('', resumeLine())
       body.push('', '---', footer(), whereLine)
       if (behindLine) body.push(behindLine)
       return { result: body.join('\n') }
