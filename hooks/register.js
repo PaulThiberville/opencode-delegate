@@ -483,6 +483,11 @@ export function register(on) {
           "relu dans sa session, plus l'id a repasser dans `resume` pour",
           'reprendre la. Le budget plafonne un appel, pas une tache : une tache',
           'longue se mene en plusieurs reprises sur la meme session opencode.',
+          'Lancer les delegations dans des messages separes plutot que plusieurs',
+          'dans le meme : les appels d\'outil emis ensemble rendent leurs resultats',
+          'ensemble, donc une delegation courte groupee avec une longue reste',
+          "invisible jusqu'a ce que la longue finisse. Elles tournent bien en",
+          'parallele, mais rien ne revient avant la derniere.',
         ].join(' '),
         inputSchema: {
           type: 'object',

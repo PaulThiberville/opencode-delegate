@@ -354,6 +354,22 @@ cd ~/Documents/Dev-Perso/opencode-delegate && claude plugin validate . --strict 
   pane coûte zéro et montre ce que le panneau natif n'a pas : coût opencode,
   tokens, id de session.
 
+## Plusieurs délégations à la fois
+
+Le mod ne sérialise rien : deux délégations lancées ensemble tournent vraiment
+en parallèle, et `tests/concurrency.test.ts` le vérifie — la courte se termine
+pendant que la longue continue.
+
+Ce qui *semble* les sérialiser vient du protocole, pas du mod. Quand Claude émet
+plusieurs appels d'outil **dans le même message**, les résultats doivent revenir
+ensemble, dans un seul message en retour. Le résultat de la courte est donc prêt
+et attend, invisible, que la longue rende la main : si l'une atteint son budget
+de dix minutes, rien ne revient avant.
+
+La parade est côté usage : lancer les délégations dans des **messages séparés**,
+ou leur donner des budgets comparables. La description de l'outil le dit à
+Claude, pour qu'il cesse de les grouper.
+
 ## Limites connues
 
 - Une délégation en écriture est impossible en `claude -p` et dans l'Agent SDK :
