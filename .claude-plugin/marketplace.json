@@ -1,0 +1,17 @@
+{
+  "name": "opencode-delegate",
+  "owner": {
+    "name": "Paul Thiberville",
+    "url": "https://github.com/PaulThiberville"
+  },
+  "description": "Delegue des taches de code a opencode 2 depuis Claude Code.",
+  "plugins": [
+    {
+      "name": "opencode-delegate",
+      "source": "./",
+      "description": "Un outil de delegation vers opencode 2 et un pane qui suit les taches, leur cout et le modele utilise.",
+      "category": "workflow",
+      "keywords": ["opencode", "delegation", "sous-agent", "mod", "pane"]
+    }
+  ]
+}

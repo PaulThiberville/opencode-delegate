@@ -1,0 +1,19 @@
+{
+  "name": "opencode-delegate",
+  "version": "0.1.0",
+  "description": "Delegue des taches a opencode 2 comme sous-agent, avec un pane de suivi",
+  "author": {
+    "name": "Paul Thiberville"
+  },
+  "displayName": "opencode delegate",
+  "homepage": "https://github.com/PaulThiberville/opencode-delegate",
+  "repository": "https://github.com/PaulThiberville/opencode-delegate",
+  "license": "MIT",
+  "keywords": [
+    "opencode",
+    "delegation",
+    "sous-agent",
+    "mod",
+    "pane"
+  ]
+}
