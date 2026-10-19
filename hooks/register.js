@@ -35,6 +35,55 @@ const CANCEL = 'Annuler'
 // L'agent opencode en lecture seule, le mode par defaut de toute delegation
 const PLAN_AGENT = 'plan'
 
+// Relire la session apres une coupe, et sonder le checkout, prend quelques
+// appels de CLI : des budgets courts, pour ne pas ajouter une attente a une
+// tache qui vient deja de mourir d'attente
+const RECOVER_MS = 15_000
+const GIT_MS = 10_000
+// Le journal d'outils rendu apres une coupe : assez pour voir ce qu'opencode a
+// lu, pas assez pour noyer le resultat
+const MAX_RECOVERED_TOOLS = 20
+// Ce qu'on recopie du texte retrouve dans le transcript, quand c'est la seule
+// voie de sortie (tour abandonne : le resultat de l'outil ne va plus nulle part)
+const LOG_EXCERPT = 1_200
+
+// Pourquoi une tache s'est arretee. Les causes ne se traitent pas pareil : un
+// budget epuise invite a relancer plus large, un abandon pas du tout, une
+// erreur de fournisseur demande de regler le fournisseur d'abord. Le mot sert
+// aussi de libelle dans la carte du pane.
+const STOPS = {
+  budget: {
+    word: 'budget',
+    line: (task) =>
+      'opencode a ete coupe par le mod : le budget de ' +
+      clock(Math.round(task.timeoutMs / 1000)) +
+      ' est epuise. Ce n\'est ni une erreur d\'opencode ni un abandon : la tache tournait encore. ' +
+      'Relancer avec un `budgetMs` plus large (600000 au plafond), ou decouper la tache en morceaux.',
+  },
+  abandoned: {
+    word: 'abandon',
+    line: () =>
+      "Le tour a ete abandonne pendant la delegation (l'utilisateur a interrompu, ou le moteur a coupe) : " +
+      "ce n'est pas un depassement de budget. Ne pas relancer de soi-meme ; attendre que l'utilisateur redemande.",
+  },
+  provider: {
+    word: 'fournisseur',
+    line: () =>
+      "opencode a echoue cote fournisseur de modele, pas sur la tache. Relancer a l'identique redonnera la " +
+      'meme erreur : regarder la cle, le quota ou le modele avant de reessayer.',
+  },
+  run: {
+    word: 'erreur',
+    line: () => "opencode s'est arrete en erreur pendant la tache.",
+  },
+  start: {
+    word: 'demarrage',
+    line: () =>
+      "La commande `opencode` n'a pas pu demarrer, ou est morte bien avant son budget : rien n'a tourne. " +
+      'Verifier l\'installation d\'opencode plutot que relancer.',
+  },
+}
+
 // Les taches de la session, la plus recente en premier
 let tasks = []
 let seq = 0
@@ -51,6 +100,10 @@ let notice = null
 let folded = { running: false, done: false }
 // Ce que le preflight a trouve ; `reason` est deja une phrase pour l'utilisateur
 let opencode = { isReady: false, version: null, reason: "opencode n'a pas encore ete sonde" }
+// Vrai tant qu'une question d'autorisation d'ecriture attend une reponse. Le
+// moteur ne tient qu'un AskUserQuestion a la fois : deux `$.ui.ask` lances coup
+// sur coup, et le second revient en refus sans que personne ait rien refuse.
+let isAsking = false
 
 // Sonde `opencode --version` avant d'enregistrer quoi que ce soit. `$.process.run`
 // rejette si le binaire ne demarre pas, d'ou le try/catch ; un code de sortie non
@@ -147,11 +200,119 @@ function parseEvents(stdout) {
       const status = (part.state && part.state.status) || 'unknown'
       toolCalls.push({ tool: part.tool, status })
     } else if (event.type === 'error') {
-      errors.push((event.error && event.error.message) || 'erreur opencode sans message')
+      const error = event.error || {}
+      errors.push({
+        type: typeof error.type === 'string' ? error.type : '',
+        message: error.message || 'erreur opencode sans message',
+      })
     }
   }
 
   return { text: [...texts.values()].join('\n').trim(), toolCalls, errors, sessionId }
+}
+
+// `$.process.run` ne rend rien du tout quand il tue le processus : tout ce
+// qu'opencode a produit est perdu cote flux NDJSON. La session, elle, l'a garde.
+// On la relit donc pour rendre quand meme le dernier texte et le journal des
+// outils appeles — sept minutes de lecture valent mieux qu'une ligne d'echec.
+//
+// La forme n'est pas celle de `session.get` : `{ data: [messages] }`, du plus
+// recent au plus ancien ; un message `idle` porte `outcome` et, en cas d'echec,
+// `error` ; un message `assistant` porte `content`, ou une part de texte est
+// `{ type: 'text', text }` et une part d'outil `{ type: 'tool', name, state }`
+// (`name`, pas `tool` comme dans le flux).
+async function recoverPartial($, sessionId) {
+  if (!sessionId) return null
+  let out
+  try {
+    out = await $.process.run(
+      ['opencode', 'api', 'session.message.list', '--param', 'sessionID=' + sessionId],
+      { timeoutMs: RECOVER_MS },
+    )
+  } catch {
+    return null
+  }
+  if (out.exitCode !== 0) return null
+  let items
+  try {
+    const body = JSON.parse(out.stdout)
+    items = body.data || body
+  } catch {
+    return null
+  }
+  if (!Array.isArray(items)) return null
+
+  let text = null
+  let error = null
+  let outcome = null
+  const tools = []
+  for (const message of items) {
+    if (!message) continue
+    // le plus recent d'abord : le premier `outcome` et la premiere erreur
+    // rencontres sont les derniers qu'opencode ait enregistres
+    if (!outcome && typeof message.outcome === 'string') outcome = message.outcome
+    if (!error && message.error && message.error.message) error = message.error.message
+    for (const part of message.content || []) {
+      if (!part) continue
+      if (part.type === 'text' && typeof part.text === 'string' && !text) {
+        text = part.text.trim() || null
+      } else if (part.type === 'tool') {
+        const name = part.name || part.tool
+        const status = (part.state || {}).status
+        if (name) tools.push(status && status !== 'completed' ? name + ' (' + status + ')' : name)
+      }
+    }
+  }
+  // les outils ont ete collectes a l'envers du temps
+  tools.reverse()
+  return { text, error, outcome, tools: tools.slice(-MAX_RECOVERED_TOOLS) }
+}
+
+// Ou et sur quoi la tache va tourner. Un agent a conclu de travers parce
+// qu'opencode lisait un checkout en retard sans que personne puisse s'en
+// apercevoir : le resultat nomme donc toujours le repertoire effectif, le
+// commit de depart, l'etat sale, et le retard sur l'amont quand il y en a.
+async function probeCheckout($, cwd) {
+  const at = { timeoutMs: GIT_MS }
+  if (cwd) at.cwd = cwd
+  const look = async (argv) => {
+    try {
+      const out = await $.process.run(argv, at)
+      return out.exitCode === 0 ? out.stdout : null
+    } catch {
+      return null
+    }
+  }
+
+  // `pwd` plutot qu'un calcul de chemin : un `dir` relatif devient absolu, et
+  // le module de hooks n'a pas de quoi joindre deux chemins lui-meme
+  const here = await look(['pwd'])
+  const found = { dir: here ? here.trim() || null : null, commit: null, branch: null, isDirty: false, behind: 0 }
+
+  // `HEAD --abbrev-ref HEAD` rend le sha puis le nom de branche, en un appel
+  const head = await look(['git', 'rev-parse', 'HEAD', '--abbrev-ref', 'HEAD'])
+  if (!head) return found
+  const lines = head.trim().split('\n')
+  found.commit = (lines[0] || '').slice(0, 12) || null
+  // un HEAD detache rend « HEAD » comme nom de branche : rien a nommer
+  if (lines[1] && lines[1] !== 'HEAD') found.branch = lines[1]
+
+  const status = await look(['git', 'status', '--porcelain'])
+  found.isDirty = Boolean(status && status.trim())
+
+  // Le cas qui a produit la fausse conclusion : un checkout en retard sur son
+  // amont. Sans amont configure, la commande sort en erreur et on n'en dit rien.
+  const behind = await look(['git', 'rev-list', '--count', 'HEAD..@{upstream}'])
+  if (behind) found.behind = Number(behind.trim()) || 0
+  return found
+}
+
+// 8s, 1m12, 11m05
+function clock(total) {
+  if (total < 60) return total + 's'
+  const minutes = Math.floor(total / 60)
+  const seconds = String(total % 60).padStart(2, '0')
+  return minutes + 'm' + seconds
 }
 
 function elapsed(task) {
@@ -159,13 +320,17 @@ function elapsed(task) {
   return Math.round((end - task.startedAt) / 1000)
 }
 
-// 8s, 1m12, 11m05
 function duration(task) {
-  const total = elapsed(task)
-  if (total < 60) return total + 's'
-  const minutes = Math.floor(total / 60)
-  const seconds = String(total % 60).padStart(2, '0')
-  return minutes + 'm' + seconds
+  return clock(elapsed(task))
+}
+
+// Ce qu'il reste de budget a une tache en cours, pour voir venir la coupe au
+// lieu de la subir. Vide une fois la tache finie : le budget ne veut plus rien
+// dire, et la duree est deja la.
+function remaining(task) {
+  if (task.status !== 'running' || !task.timeoutMs) return ''
+  const left = Math.round((task.startedAt + task.timeoutMs - Date.now()) / 1000)
+  return 'reste ' + clock(Math.max(left, 0))
 }
 
 function money(cost) {
