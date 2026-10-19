@@ -379,15 +379,6 @@ function duration(task) {
   return clock(elapsed(task))
 }
 
-// Ce qu'il reste de budget a une tache en cours, pour voir venir la coupe au
-// lieu de la subir. Vide une fois la tache finie : le budget ne veut plus rien
-// dire, et la duree est deja la.
-function remaining(task) {
-  if (task.status !== 'running' || !task.timeoutMs) return ''
-  const left = Math.round((task.startedAt + task.timeoutMs - Date.now()) / 1000)
-  return 'reste ' + clock(Math.max(left, 0))
-}
-
 function money(cost) {
   if (typeof cost !== 'number' || cost === 0) return ''
   return '$' + cost.toFixed(4)
@@ -996,9 +987,9 @@ export function register(on) {
       // reussite dans la liste des terminees.
       const color = isRunning ? 'blue' : task.status === 'done' ? 'green' : 'red'
       const model = shortModel(task.model)
-      // En cours, le budget restant est colle a la duree : on voit venir la
-      // coupe au lieu de la subir. Fini, il ne veut plus rien dire.
-      const time = [duration(task), remaining(task)].filter(Boolean).join('  ')
+      // La duree de la session entiere, et rien d'autre : le budget restant ne
+      // fait qu'inquieter, puisqu'une coupure se reprend par `resume`
+      const time = duration(task)
       const head = task.title || model
       // La seconde ligne dit le modele et ce qu'il a consomme. Le reste n'y
       // apparait qu'a l'exception pres : une ecriture, ou un arret subi.

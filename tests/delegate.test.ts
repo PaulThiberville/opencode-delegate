@@ -351,7 +351,7 @@ test('hors depot git, le resultat le dit au lieu d\'inventer un commit', async (
   expect(out.result).toContain('ou: /work (hors depot git)')
 })
 
-test('la carte montre le budget restant pendant que la tache tourne', async ($, on) => {
+test('la carte en cours ne montre que la duree, pas le budget restant', async ($, on) => {
   const clock = mock.clock(on)
   mock.env(on, {})
   stubEngine(on, clock, new Map())
@@ -361,8 +361,9 @@ test('la carte montre le budget restant pendant que la tache tourne', async ($, 
   await clock.advance(2000) // la tache tourne encore
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  // on voit venir la coupe au lieu de la subir
-  expect(await ui.find({ type: 'Text', text: /reste 10m/ })).toBeDefined()
+  // le budget restant n'inquiete plus pour rien : une coupure se reprend
+  expect(await ui.find({ type: 'Text', text: /reste/ })).toBeUndefined()
+  expect(await ui.find({ key: 'task-1' })).toBeDefined()
   await ui.unmount()
 
   await clock.advance(4000)

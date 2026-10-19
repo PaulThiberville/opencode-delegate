@@ -53,7 +53,8 @@ Une carte par **session opencode**, pas par appel : une reprise avec `resume`
 repasse la même carte en « En cours » et lui ajoute un segment, au lieu d'en
 créer une seconde au même titre. Trois lignes, sur le modèle du panneau
 « tâches en arrière-plan » de Claude Code : le titre de la session et sa durée
-cumulée ; le modèle et les tokens consommés sur toute la session ; puis le
+cumulée, rien d'autre : le budget restant ne faisait qu'inquiéter pour rien,
+puisqu'une coupure se reprend par `resume` ; le modèle et les tokens consommés sur toute la session ; puis le
 nombre d'appels d'outils, dépliable pour voir chacun avec sa durée. Le début du
 prompt n'est jamais affiché — c'est du transcript, illisible en une ligne ;
 tant qu'opencode n'a pas nommé sa session, le modèle prend la place du titre.
@@ -64,11 +65,7 @@ qu'une session recousue garde la trace de ce qui l'a interrompue. La bordure
 est neutre : le statut tient dans le glyphe et dans la section qui porte la
 carte.
 
-Tant que la tâche tourne, la première ligne porte aussi le **budget restant**
-(`reste 3m48`) : on voit venir la coupe au lieu de la subir, et on peut ouvrir
-`/opencode` pour savoir s'il vaut mieux attendre ou relancer plus large. Une
-fois la tâche finie, le budget ne veut plus rien dire et disparaît ; à la place,
-une tâche mal arrêtée porte en seconde ligne **la cause** de son arrêt
+Une tâche mal arrêtée porte en seconde ligne **la cause** de son arrêt
 (`budget`, `abandon`, `fournisseur`, `erreur`, `demarrage`).
 
 Le sélecteur **Modele** liste les modèles récents d'abord, puis ceux des mêmes
