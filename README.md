@@ -9,8 +9,9 @@ Mod Claude Code qui utilise **opencode 2** comme sous-agent.
 - Enregistre un outil `mcp__opencode-delegate__delegate` que Claude peut appeler
   comme un `Task`, avec `prompt`, `writeFiles`, `model`, `agent`, `dir`,
   `resume`, `budgetMs`.
-- Lance `opencode run --format json --session <id> -m <model>` via
-  `$.process.run`, en `--agent plan` (lecture seule) par défaut, et seulement
+- Lance `opencode run --format json -m <model>` via
+  `$.process.run` (plus `--session <id>` sur un `resume`), en `--agent plan`
+  (lecture seule) par défaut, et seulement
   avec `--auto` quand l'utilisateur vient d'autoriser l'écriture. En v2,
   `opencode run` parle au **service de fond** : pas de cold start à chaque tâche.
 - Pendant le run, un timer interroge `opencode api session.get` toutes les 2 s
@@ -20,6 +21,12 @@ Mod Claude Code qui utilise **opencode 2** comme sous-agent.
   Claude y pense sans qu'on ait à le lui rappeler.
 - Rend à Claude la réponse finale d'opencode + l'id de session, à repasser dans
   `resume` pour un suivi sur la même conversation opencode.
+- Nomme dans chaque résultat **où et sur quoi** la tâche a tourné : répertoire
+  effectif, commit de départ, état du checkout, et un avertissement quand le
+  checkout est en retard sur son amont.
+- Quand la tâche s'arrête sans conclure, **dit pourquoi** et rend quand même ce
+  qu'opencode avait déjà produit : voir [Quand la tâche s'arrête
+  mal](#quand-la-tâche-sarrête-mal).
 
 ## Le pane
 
@@ -30,7 +37,7 @@ Autre   provider/model (457 au catalogue)
 
 En cours 1 ⌄
 ╭────────────────────────────────────────╮
-│ Refactor du module auth           1m12 │
+│ Refactor du module auth   1m12  reste 3m48│
 │ ▸ kimi-k2.7-code  ecriture  $0.0032    │
 ╰────────────────────────────────────────╯
 
@@ -47,6 +54,13 @@ transcript, illisible en une ligne ; tant qu'opencode n'a pas nommé sa session,
 le modèle prend la place du titre. La bordure est neutre : le statut tient dans
 le glyphe, seul signe qui distingue un échec d'une réussite parmi les terminées,
 et dans la section qui porte la carte.
+
+Tant que la tâche tourne, la première ligne porte aussi le **budget restant**
+(`reste 3m48`) : on voit venir la coupe au lieu de la subir, et on peut ouvrir
+`/opencode` pour savoir s'il vaut mieux attendre ou relancer plus large. Une
+fois la tâche finie, le budget ne veut plus rien dire et disparaît ; à la place,
+une tâche mal arrêtée porte en seconde ligne **la cause** de son arrêt
+(`budget`, `abandon`, `fournisseur`, `erreur`, `demarrage`).
 
 Le sélecteur **Modele** liste les modèles récents d'abord, puis ceux des mêmes
 fournisseurs, puis le reste du catalogue d'`opencode models`, chargé en tâche
@@ -85,6 +99,85 @@ Le préflight bloque le premier prompt, donc son budget est court. Il tourne une
 fois par session : une installation d'opencode faite en cours de session n'est
 vue qu'à la session suivante.
 
+## Quand la tâche s'arrête mal
+
+`$.process.run` ne streame pas : il lit toute la sortie à la fin. Et quand il
+tue le processus — budget épuisé, évènement abandonné — il **rejette sans rien
+rendre du tout**. Sept minutes de lecture pouvaient donc se solder par une
+ligne d'échec, et, pire, par une ligne d'échec qui ne disait pas *laquelle*.
+
+### La cause est nommée
+
+Cinq causes, qui ne se traitent pas de la même façon. Le résultat rendu à
+Claude s'ouvre sur la phrase qui va avec, et la carte du pane porte le mot :
+
+| Carte | Ce qui s'est passé | Ce que le résultat conseille |
+| :- | :- | :- |
+| `budget` | le processus tournait encore quand `budgetMs` a été atteint | relancer avec un `budgetMs` plus large, ou découper |
+| `abandon` | `next.signal` s'est abattu : tour interrompu, ou moteur qui a coupé | **ne pas** relancer de soi-même |
+| `fournisseur` | une erreur `provider.*` dans le flux (clé, quota, modèle) | régler le fournisseur d'abord : relancer à l'identique redonnera la même erreur |
+| `erreur` | opencode s'est arrêté en erreur sur la tâche | lire le détail |
+| `demarrage` | la commande n'a pas pu démarrer, ou est morte bien avant son budget | vérifier l'installation, rien n'a tourné |
+
+Les trois premières sont celles qui coûtaient cher à confondre. Elles se
+distinguent par deux signaux différents, et non par le message d'erreur :
+
+- **l'abandon**, par `next.signal`, l'`AbortSignal` du hook, qui s'abat quand
+  l'évènement est abandonné ;
+- **le budget**, par un `$.clock.after(budgetMs)` armé avant le lancement : s'il
+  s'est déclenché avant que `$.process.run` rejette, c'est que le processus a
+  tenu jusqu'au bout. Comparer des `Date.now()` n'aurait pas suffi — une
+  commande qui refuse de démarrer rejette aussi, et c'est un tout autre
+  diagnostic.
+
+### La sortie partielle est rendue quand même
+
+Le flux est perdu, mais **la session d'opencode a tout gardé** : tuer le CLI
+`opencode run` ne tue pas la session côté service de fond. Le mod retrouve donc
+la session (`opencode api session.list`, comme pour le suivi live) et la relit
+par `opencode api session.message.list --param sessionID=<id>` pour en sortir :
+
+- le **dernier texte** produit par l'assistant, rendu tel quel à Claude ;
+- le **journal des outils** appelés, dans l'ordre, avec leur statut quand il
+  n'est pas `completed` — le minimum utile quand il n'y a pas de texte ;
+- la **dernière erreur** enregistrée par la session, s'il y en a une.
+
+La forme de cette réponse n'est pas celle de `session.get` : c'est
+`{ data: [messages] }`, **du plus récent au plus ancien** ; un message `idle`
+porte `outcome` et, en cas d'échec, `error` ; un message `assistant` porte
+`content`, où une part de texte est `{ type: 'text', text }` et une part d'outil
+`{ type: 'tool', name, state: { status } }` — `name`, et non `tool` comme dans
+le flux NDJSON. Les messages arrivent à l'envers du temps mais les parts d'un
+message sont dans l'ordre, d'où le regroupement par message avant inversion :
+sans ça le journal d'outils se lit à l'envers.
+
+Quand la session ne garde aucun texte, le résultat le dit, au lieu de laisser
+croire qu'opencode n'a rien trouvé.
+
+**Cas particulier de l'abandon :** un tour abandonné a déjà repris sans nous, et
+le résultat de l'outil ne va plus nulle part. Le texte retrouvé est donc aussi
+recopié dans le transcript par `$.ui.log` — la seule voie qui reste pour rendre
+à l'utilisateur ce qu'il a payé.
+
+### Où et sur quoi la tâche a tourné
+
+Chaque résultat, succès compris, se termine par une ligne du genre :
+
+```
+ou: /Users/paul/projet @ 4bf7906ab12c (main) checkout sale
+```
+
+Le répertoire **effectif** (obtenu par un `pwd` dans le `cwd` visé, ce qui
+résout un `dir` relatif), le commit de départ, la branche, et l'état sale du
+checkout. Quand le checkout est en retard sur son amont, une seconde ligne le
+dit et invite à pondérer la conclusion.
+
+C'est le correctif d'un cas réel : un agent a conclu de travers parce
+qu'opencode lisait un checkout en retard, sans que personne puisse s'en
+apercevoir. Attention, `git rev-list --count HEAD..@{upstream}` mesure le retard
+sur l'amont **tel que le dernier `fetch` l'a laissé**, pas sur le dépôt distant
+maintenant : le mod ne fetche pas tout seul.
+
 ## Permissions
 
 Toute délégation part en **lecture seule** : `--agent plan`, l'agent read-only
@@ -113,6 +206,30 @@ derrière. L'`agent` n'est honoré qu'une fois l'écriture autorisée.
 
 Le pied de page rendu à Claude et la carte du pane nomment le mode retenu, pour
 qu'une tâche dégradée en lecture seule ne passe pas pour une tâche qui a écrit.
+
+### Une seule délégation en écriture à la fois
+
+Le moteur ne tient **qu'un `AskUserQuestion` à la fois**. Deux délégations en
+écriture lancées coup sur coup dans le même tour, et la seconde question revient
+en refus — sans que personne ait rien refusé. Claude lisait alors un « non » de
+l'utilisateur qui n'existait pas.
+
+Le mod refuse donc lui-même la seconde, avec un message qui dit quoi faire :
+attendre le résultat de la première, puis rappeler l'outil. C'est écrit dans la
+description de l'outil, pour que Claude ne lance pas deux demandes en parallèle
+en premier lieu. Le garde-fou ne porte que sur l'écriture : les délégations en
+lecture seule ne demandent rien et peuvent partir en parallèle.
+
+Le garde-fou retient la *date* de la question en cours, pas un booléen : un hook
+tué en pleine question ne remet rien à zéro, et un drapeau resté levé
+interdirait l'écriture pour tout le processus. Au-delà de quinze minutes il est
+tenu pour périmé.
+
+Sérialiser au lieu de refuser était tentant : faire attendre la seconde que la
+première soit répondue. Mais attendre une promesse qui n'est pas un appel de
+`$` consomme le budget propre du hook (10 s), et une question attend une
+personne, donc des minutes : le second hook serait déclaré absent avant d'avoir
+posé sa question.
 
 ### Pourquoi `$.ui.ask` plutôt qu'un argument d'outil ou un interrupteur de pane
 
@@ -180,9 +297,32 @@ cd ~/Documents/Dev-Perso/opencode-delegate && claude plugin validate . --strict 
 
 - **`$.process.run` et pas `$.process.spawn`** : le `.d.ts` publié ne déclare
   que `run`. `run` lit toute la sortie à la fin (pas de streaming) et plafonne à
-  dix minutes ; le suivi live vient donc du polling, pas du flux. Si `spawn`
-  existe dans le build installé, c'est l'axe d'amélioration : on lirait les
-  événements NDJSON au fil de l'eau.
+  dix minutes ; le suivi live vient donc du polling, pas du flux. `spawn` est
+  apparu dans les `.d.ts` de builds plus récents (`claude-code` 2.1.299) ; le mod
+  ne s'en sert pas, pour rester chargeable sur un build qui ne l'a pas. C'est
+  l'axe d'amélioration : avec `spawn`, les événements NDJSON se liraient au fil
+  de l'eau et la sortie partielle n'aurait plus à être relue dans la session.
+- **Pas d'option de worktree jetable.** L'idée était de laisser `dir` accepter
+  une référence git (`origin/main`) et de créer un worktree détaché, pour qu'une
+  lecture ne dépende jamais de l'état du checkout de l'opérateur. Écartée :
+  - un worktree **écrit dans le `.git` de l'opérateur** (`git worktree add`), ce
+    qui est une écriture de plus, faite sans la question de `$.ui.ask`, et
+    jusque dans une délégation annoncée comme en lecture seule ;
+  - il faut le **retirer** après, et le mod n'a précisément aucune garantie de
+    tourner jusqu'au bout — un tour abandonné laisserait un worktree orphelin
+    dans `git worktree list` à chaque fois, et `git worktree prune` ne le
+    nettoie qu'une fois le répertoire temporaire disparu ;
+  - `origin/main` ne vaut que ce que vaut le dernier `fetch`, donc il faudrait
+    aussi fetcher — du réseau, du temps, et un comportement implicite.
+
+  Ce qui restait du besoin, c'est de ne pas conclure de travers sans le savoir :
+  d'où la ligne `ou:` et l'avertissement de retard, qui coûtent trois `git` en
+  lecture et rien d'autre. Un worktree reste la bonne réponse quand on en veut
+  un, mais à la main, et `dir` prend alors son chemin :
+
+  ```bash
+  git fetch origin && git worktree add --detach /tmp/ro-main origin/main
+  ```
 - **La session est créée par `opencode run`, pas par l'API.** Deux contraintes
   se contredisent. Le palier **gratuit** d'OpenCode Console lit un id de session
   qu'il n'a pas émis comme un appel « hors d'OpenCode » et répond
@@ -231,3 +371,22 @@ cd ~/Documents/Dev-Perso/opencode-delegate && claude plugin validate . --strict 
   droit. À savoir si le mod part un jour dans l'équipe par ce canal.
 - Le pane ne rend rien en `claude -p` ni dans l'Agent SDK.
 - `tasks` grandit sans limite sur la durée de la session.
+- La récupération de sortie partielle suppose que la session a été **retrouvée**
+  dans `opencode api session.list`. Quand elle ne l'est pas — plusieurs tâches
+  démarrées dans le même répertoire à la même seconde, service de fond muet — il
+  n'y a rien à relire et le résultat n'a que la cause de l'arrêt.
+- Le cas `abandon` n'est **pas couvert par les tests** : il se reconnaît à
+  `next.signal`, et le kit de `claude plugin test` n'a pas de quoi abattre ce
+  signal. Les quatre autres causes le sont (`tests/failure.test.ts`).
+- Toujours sur l'abandon : la relecture de la session et le `$.ui.log` partent
+  **après** que le signal s'est abattu, dans les cinq secondes de grâce du hook.
+  Le temps passé dans un appel de `$` ne compte pas dans ce budget, mais si le
+  moteur refuse les appels d'un hook dont le tour est parti, il n'y aura rien à
+  recopier. Tout est dans des `try`/`catch` : au pire la cause est rendue seule.
+- Le retard sur l'amont est mesuré par `git rev-list --count HEAD..@{upstream}`,
+  donc **tel que le dernier `fetch` l'a laissé**. Le mod ne fetche pas : un
+  checkout jamais fetché depuis des jours passe pour à jour.
+- Sonder le checkout coûte quatre commandes (`pwd` et trois `git`) avant chaque
+  délégation. C'est de la lecture, et le temps passé dans un appel de `$` ne
+  compte pas dans le budget du hook, mais ça rallonge de quelques dizaines de
+  millisecondes le départ de chaque tâche.
