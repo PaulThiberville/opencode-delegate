@@ -669,6 +669,37 @@ dans le tour en cours : chaque appel rend la main tout de suite, donc plus rien
 n'attend personne, et les comptes rendus reviennent au fil des fins — groupés
 quand elles tombent ensemble.
 
+## Arrêter une délégation
+
+Chaque carte en cours porte un bouton **arreter**, à côté du compte des appels.
+Il n'apparaît que lorsque la session opencode a été retrouvée : avant ça, il n'y
+a rien à interrompre, et un bouton mort vaut moins que pas de bouton.
+
+Un clic fait deux choses : il interrompt la session opencode
+(`session.interrupt`), ce qui arrête le travail côté serveur, et il libère le
+mod de son attente. La carte passe à l'état `arrete`, distinct d'un budget
+épuisé et d'une erreur, et le compte rendu partiel est rendu tout de suite en
+relisant la session — la réponse d'opencode arrive donc à Claude sans attendre,
+avec l'id à repasser dans `resume`. En délégation de fond, c'est la
+notification qui le porte.
+
+**La partie désagréable, et c'est une limite, pas un oubli :** le processus
+`opencode run` n'est pas tué. `$.process.run` n'offre aucune prise dessus — ni
+PID, ni annulation — et la mesure est sans appel : interrompre la session
+répond bien `{"interrupted": true}`, mais le processus était toujours vivant
+45 secondes plus tard. Il traînera donc jusqu'à son budget avant de sortir.
+
+C'est pour ça que le mod met le processus **en course** avec le bouton plutôt
+que d'attendre sa sortie : le premier des deux décide, et le résultat tardif du
+perdant retombe dans un `then` dont personne ne lit la valeur. Sans cette
+course, une tâche arrêtée se terminerait une seconde fois : elle écraserait son
+état `arrete` et, en arrière-plan, enverrait un second compte rendu. Un test
+tient ce cas.
+
+Si l'interruption elle-même échoue — service injoignable, session déjà finie —
+le mod cesse quand même d'attendre et le dit. Le travail peut alors continuer
+côté opencode sans que personne l'écoute.
+
 ## Limites connues
 
 - Une délégation en écriture est impossible en `claude -p` et dans l'Agent SDK :
