@@ -21,6 +21,40 @@ const CATALOG = ['ollama-cloud/gpt-oss:20b', 'ollama-cloud/kimi-k2.7-code', 'ope
 const SERVER_SID = 'ses_eac681071ffewObMBj6e5N7Ykt'
 let listFinds = true
 
+// La forme reelle d'`opencode api session.message.list` : du plus recent au
+// plus ancien, un `idle` qui porte l'issue, des `assistant` qui portent les
+// parts — une part d'outil s'appelle `name`, pas `tool` comme dans le flux
+const PARTIAL_MESSAGES = [
+  { id: 'm3', time: { created: 3 }, type: 'idle', outcome: 'failed' },
+  {
+    id: 'm2',
+    time: { created: 2 },
+    type: 'assistant',
+    content: [{ type: 'text', text: 'ce que j\'ai lu jusqu\'ici' }],
+  },
+  {
+    id: 'm1',
+    time: { created: 1 },
+    type: 'assistant',
+    content: [
+      { type: 'tool', name: 'read', state: { status: 'completed' } },
+      { type: 'tool', name: 'grep', state: { status: 'error' } },
+    ],
+  },
+]
+let messages: unknown[] = PARTIAL_MESSAGES
+// L'etat du checkout que le sondage trouve : commit, branche, proprete, retard
+let checkout = { head: 'abc123def456789\nmain\n', dirty: '', behindCode: 1, behind: '' }
+
+function git(argv: readonly string[]) {
+  if (argv[1] === 'rev-parse') return { exitCode: 0, stdout: checkout.head, stderr: '' }
+  if (argv[1] === 'status') return { exitCode: 0, stdout: checkout.dirty, stderr: '' }
+  if (argv[1] === 'rev-list') {
+    return { exitCode: checkout.behindCode, stdout: checkout.behind, stderr: '' }
+  }
+  return { exitCode: 1, stdout: '', stderr: '' }
+}
+
 // Ce que `opencode --version` repond, et ce que l'utilisateur repond a la
 // question d'autorisation d'ecriture ; chaque test peut les changer
 const ALLOW = "Autoriser l'ecriture"
@@ -47,6 +81,8 @@ function stubEngine(on: any, clock: any, saved: Map<string, unknown>) {
   listFinds = true
   version = 'opencode v2.0.32'
   askAnswer = ALLOW
+  messages = PARTIAL_MESSAGES
+  checkout = { head: 'abc123def456789\nmain\n', dirty: '', behindCode: 1, behind: '' }
   const argvs: string[][] = []
   on('tool.register', () => ({ value: undefined }))
   on('command.register', () => ({ value: undefined }))
@@ -73,6 +109,11 @@ function stubEngine(on: any, clock: any, saved: Map<string, unknown>) {
     argvs.push(argv)
     if (argv[1] === '--version') return { value: { exitCode: 0, stdout: version, stderr: '' } }
     if (argv[1] === 'models') return { value: { exitCode: 0, stdout: CATALOG, stderr: '' } }
+    if (argv[0] === 'pwd') return { value: { exitCode: 0, stdout: '/work\n', stderr: '' } }
+    if (argv[0] === 'git') return { value: git(argv) }
+    if (argv[2] === 'session.message.list') {
+      return { value: { exitCode: 0, stdout: JSON.stringify({ data: messages }), stderr: '' } }
+    }
     if (argv[2] === 'session.list') {
       const items = listFinds
         ? [{ id: SERVER_SID, time: { created: Date.now() }, location: { directory: '/work' } }]
@@ -256,6 +297,81 @@ test("la carte montre le titre de session, jamais le debut du prompt", async ($,
   expect(await ui.find({ type: 'Text', text: 'Lecture de a.txt' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /Lis a\.txt/ })).toBeUndefined()
   await ui.unmount()
+})
+
+test('le resultat nomme le repertoire effectif, le commit et le checkout propre', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  stubEngine(on, clock, new Map())
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  const out: any = await runTask($, clock)
+
+  // sans ca, un agent conclut de travers sans que personne puisse s'en apercevoir
+  expect(out.result).toContain('ou: /work @ abc123def456 (main) checkout propre')
+})
+
+test('un checkout sale est nomme comme tel', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  stubEngine(on, clock, new Map())
+  checkout.dirty = ' M hooks/register.js\n'
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  const out: any = await runTask($, clock)
+
+  expect(out.result).toContain('checkout sale')
+})
+
+test('un checkout en retard sur son amont est signale', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  stubEngine(on, clock, new Map())
+  checkout.behindCode = 0
+  checkout.behind = '12\n'
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  const out: any = await runTask($, clock)
+
+  // le cas exact qui a produit une fausse conclusion : opencode lisait un
+  // checkout en retard et rien ne le disait
+  expect(out.result).toContain('12 commit(s) derriere son amont')
+  expect(out.result).toContain('etat en retard')
+})
+
+test('hors depot git, le resultat le dit au lieu d\'inventer un commit', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  stubEngine(on, clock, new Map())
+  checkout.head = ''
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  const out: any = await runTask($, clock)
+
+  expect(out.result).toContain('ou: /work (hors depot git)')
+})
+
+test('la carte montre le budget restant pendant que la tache tourne', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  stubEngine(on, clock, new Map())
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  const pending = $.tool.call({ tool: TOOL, prompt: 'Lis a.txt', budgetMs: 600_000 })
+  await clock.advance(2000) // la tache tourne encore
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  // on voit venir la coupe au lieu de la subir
+  expect(await ui.find({ type: 'Text', text: /reste 10m/ })).toBeDefined()
+  await ui.unmount()
+
+  await clock.advance(4000)
+  await pending
+
+  // une fois finie, le budget ne veut plus rien dire : seule la duree reste
+  const after = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await after.find({ type: 'Text', text: /reste/ })).toBeUndefined()
+  await after.unmount()
 })
 
 test('sans titre, la carte ne retombe pas sur le prompt', async ($, on) => {

@@ -100,10 +100,15 @@ let notice = null
 let folded = { running: false, done: false }
 // Ce que le preflight a trouve ; `reason` est deja une phrase pour l'utilisateur
 let opencode = { isReady: false, version: null, reason: "opencode n'a pas encore ete sonde" }
-// Vrai tant qu'une question d'autorisation d'ecriture attend une reponse. Le
-// moteur ne tient qu'un AskUserQuestion a la fois : deux `$.ui.ask` lances coup
-// sur coup, et le second revient en refus sans que personne ait rien refuse.
-let isAsking = false
+// Quand la question d'autorisation d'ecriture en cours a ete posee, 0 s'il n'y
+// en a pas. Le moteur ne tient qu'un AskUserQuestion a la fois : deux `$.ui.ask`
+// lances coup sur coup, et le second revient en refus sans que personne ait rien
+// refuse. Une date plutot qu'un booleen parce qu'un hook tue en pleine question
+// ne remet rien a zero : au-dela de STALE_ASK_MS le drapeau est tenu pour
+// perime, sinon une seule tache morte interdirait l'ecriture pour tout le
+// processus.
+let askingSince = 0
+const STALE_ASK_MS = 900_000
 
 // Sonde `opencode --version` avant d'enregistrer quoi que ce soit. `$.process.run`
 // rejette si le binaire ne demarre pas, d'ou le try/catch ; un code de sortie non
@@ -245,9 +250,13 @@ async function recoverPartial($, sessionId) {
   let text = null
   let error = null
   let outcome = null
-  const tools = []
+  // Les messages viennent a l'envers du temps, mais les parts d'un message sont
+  // dans l'ordre : on garde un groupe par message, puis on remet les groupes
+  // dans l'ordre, pour que le journal se lise comme la tache s'est deroulee
+  const groups = []
   for (const message of items) {
     if (!message) continue
+    const mine = []
     // le plus recent d'abord : le premier `outcome` et la premiere erreur
     // rencontres sont les derniers qu'opencode ait enregistres
     if (!outcome && typeof message.outcome === 'string') outcome = message.outcome
@@ -259,12 +268,14 @@ async function recoverPartial($, sessionId) {
       } else if (part.type === 'tool') {
         const name = part.name || part.tool
         const status = (part.state || {}).status
-        if (name) tools.push(status && status !== 'completed' ? name + ' (' + status + ')' : name)
+        if (name) mine.push(status && status !== 'completed' ? name + ' (' + status + ')' : name)
       }
     }
+    if (mine.length) groups.push(mine)
   }
-  // les outils ont ete collectes a l'envers du temps
-  tools.reverse()
+
+  const tools = []
+  for (let i = groups.length - 1; i >= 0; i--) tools.push(...groups[i])
   return { text, error, outcome, tools: tools.slice(-MAX_RECOVERED_TOOLS) }
 }
 
@@ -305,6 +316,15 @@ async function probeCheckout($, cwd) {
   const behind = await look(['git', 'rev-list', '--count', 'HEAD..@{upstream}'])
   if (behind) found.behind = Number(behind.trim()) || 0
   return found
+}
+
+// Un build sans `next.signal` ne doit pas faire echouer le traitement d'un echec
+function isAborted(next) {
+  try {
+    return Boolean(next.signal && next.signal.aborted)
+  } catch {
+    return false
+  }
 }
 
 // 8s, 1m12, 11m05
@@ -420,8 +440,17 @@ export function register(on) {
           "l'utilisateur est alors interroge et doit autoriser l'ecriture lui-meme,",
           "sans quoi la delegation n'a pas lieu. Ne pas passer `writeFiles` pour",
           'une tache dont le perimetre de fichiers est flou.',
+          'Une seule delegation en ecriture a la fois : le moteur ne tient',
+          "qu'une question a la fois, donc deux appels `writeFiles` dans le meme",
+          'tour font refuser le second. Les delegations en lecture seule, elles,',
+          'peuvent partir en parallele.',
           "L'outil rend la reponse finale d'opencode, plus l'id de session a passer",
-          'dans `resume` pour un suivi sur la meme conversation opencode.',
+          'dans `resume` pour un suivi sur la meme conversation opencode, le',
+          'repertoire ou la tache a tourne et le commit de depart.',
+          "Quand la tache s'arrete sans conclure, le resultat dit pourquoi",
+          '(budget epuise, tour abandonne, erreur de fournisseur, demarrage',
+          "impossible) et rend quand meme ce qu'opencode avait deja produit,",
+          'relu dans sa session.',
         ].join(' '),
         inputSchema: {
           type: 'object',
@@ -434,7 +463,7 @@ export function register(on) {
             writeFiles: {
               type: 'boolean',
               description:
-                "A passer a true seulement si la tache doit modifier des fichiers. L'utilisateur est alors interroge et doit autoriser l'ecriture ; s'il refuse ou ne repond pas, rien ne part. Sans ce champ, la tache tourne en lecture seule.",
+                "A passer a true seulement si la tache doit modifier des fichiers. L'utilisateur est alors interroge et doit autoriser l'ecriture ; s'il refuse ou ne repond pas, rien ne part. Sans ce champ, la tache tourne en lecture seule. Une seule a la fois : un second appel avec `writeFiles` pendant qu'une question attend est refuse d'office.",
             },
             model: {
               type: 'string',
@@ -449,7 +478,7 @@ export function register(on) {
             dir: {
               type: 'string',
               description:
-                'Repertoire de travail de la tache, absolu ou relatif a la session. Par defaut celui de la session.',
+                "Repertoire de travail de la tache, absolu ou relatif a la session. Par defaut celui de la session. Le resultat nomme toujours le repertoire effectif, le commit de depart et l'etat du checkout, pour qu'une tache qui a lu un etat en retard soit reconnaissable. Ce champ n'accepte pas de reference git : pour lire un etat independant du checkout de l'operateur, lui demander un worktree et passer son chemin.",
             },
             resume: {
               type: 'string',
@@ -458,7 +487,8 @@ export function register(on) {
             },
             budgetMs: {
               type: 'number',
-              description: 'Budget de temps en millisecondes, 300000 par defaut, 600000 au maximum.',
+              description:
+                "Budget de temps en millisecondes, 300000 par defaut, 600000 au maximum. Au-dela, la tache est coupee : le resultat le dit et rend ce qu'opencode avait deja produit, ce qui permet de relancer plus large en connaissance de cause.",
             },
           },
           required: ['prompt'],
@@ -517,7 +547,13 @@ export function register(on) {
         "rend un compte rendu, sans toucher aux fichiers. Pour une tache qui doit",
         'ecrire, passer `writeFiles: true` : la question part a l\'utilisateur, qui',
         "autorise ou non ; sans son accord, rien ne tourne. Ne pas le passer pour",
-        'une tache dont le perimetre de fichiers est flou.',
+        'une tache dont le perimetre de fichiers est flou. Une seule delegation en',
+        'ecriture a la fois : deux questions lancees dans le meme tour font refuser',
+        'la seconde.',
+        '',
+        "Le resultat nomme le repertoire effectif, le commit de depart et l'etat du",
+        "checkout. Quand la tache est coupee, il dit pourquoi et rend quand meme ce",
+        "qu'opencode avait deja produit.",
       ].join('\n'),
     }
     return { blocks: [...below.blocks, block] }
@@ -528,24 +564,49 @@ export function register(on) {
     return {}
   })
 
-  on('tool.call', { tool: TOOL }, async ($, e) => {
+  on('tool.call', { tool: TOOL }, async ($, e, next) => {
     const model = e.model || defaultModel
     const timeoutMs = Math.min(Number(e.budgetMs) || DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS)
     const prompt = String(e.prompt || '')
+
+    // `next.signal` s'abat quand l'evenement est abandonne : c'est a ca qu'on
+    // reconnait un tour interrompu d'un budget epuise, deux causes qui ne se
+    // traitent pas pareil.
+    let isAbandoned = false
+    try {
+      if (next.signal.aborted) isAbandoned = true
+      else next.signal.addEventListener('abort', () => { isAbandoned = true }, { once: true })
+    } catch {
+      // pas de signal sur ce build : on ne distinguera pas l'abandon
+    }
 
     // L'ecriture n'est jamais implicite : Claude la demande, l'utilisateur la
     // donne. `$.ui.ask` rejette si la question est ecartee et dans un `claude -p`,
     // ou personne ne peut repondre ; dans les deux cas rien ne part.
     let mayWrite = false
     if (e.writeFiles) {
+      // Le moteur ne tient qu'un AskUserQuestion a la fois. Deux delegations en
+      // ecriture lancees dans le meme tour, et la seconde question revient en
+      // refus sans que personne ait rien refuse : on la refuse nous-memes, en
+      // disant quoi faire, plutot que de laisser Claude lire un faux « non ».
+      if (askingSince && Date.now() - askingSince < STALE_ASK_MS) {
+        return {
+          result:
+            "Une autre delegation attend deja que l'utilisateur autorise l'ecriture, et le moteur ne tient " +
+            "qu'une question a la fois. Rien ne s'est execute. Une seule delegation en ecriture a la fois : " +
+            'attendre le resultat de la premiere, puis rappeler cet outil.',
+        }
+      }
       const where = e.dir ? ' dans ' + e.dir : ''
       let answer
+      askingSince = Date.now()
       try {
         answer = await $.ui.ask(
           'Laisser opencode ecrire dans les fichiers' + where + ' pour « ' + fit(prompt, 80) + ' » ?',
           { options: [ALLOW, READ_ONLY, CANCEL], header: 'opencode' },
         )
       } catch (err) {
+        askingSince = 0
         return {
           result:
             "La delegation demandait d'ecrire dans les fichiers, et personne n'a pu l'autoriser (" +
@@ -553,6 +614,7 @@ export function register(on) {
             '). Rien ne s\'est execute. Relancer sans `writeFiles` pour une tache en lecture seule.',
         }
       }
+      askingSince = 0
       if (answer === ALLOW) mayWrite = true
       else if (answer !== READ_ONLY) {
         return {
@@ -566,14 +628,18 @@ export function register(on) {
     // Une session reprise existe deja, avec le repertoire ou elle est nee ; une
     // nouvelle sera creee par `opencode run` lui-meme, puis retrouvee
     const sessionId = e.resume || null
-    // Sur quoi reconnaitre la session a suivre : le repertoire vise, quand on
-    // peut le nommer en absolu
-    let targetDir = null
-    try {
-      const base = await $.session.cwd()
-      targetDir = !e.dir ? base || null : e.dir.startsWith('/') ? e.dir : null
-    } catch {
-      targetDir = null
+
+    // Ou et sur quoi la tache va tourner, avant de la lancer : `pwd` resout un
+    // `dir` relatif en absolu, ce qui donne aussi de quoi reconnaitre la session
+    // a suivre dans `session.list`.
+    const checkout = await probeCheckout($, e.dir)
+    let targetDir = checkout.dir
+    if (!targetDir) {
+      try {
+        targetDir = e.dir ? null : (await $.session.cwd()) || null
+      } catch {
+        targetDir = null
+      }
     }
 
     // En lecture seule, l'agent `plan` est impose : un `agent` libre choisi par
@@ -589,6 +655,9 @@ export function register(on) {
       sessionId,
       status: 'running',
       startedAt: Date.now(),
+      timeoutMs,
+      checkout,
+      stop: null,
       cost: 0,
       tokens: null,
       lastTool: null,
@@ -636,18 +705,101 @@ export function register(on) {
     const init = { timeoutMs }
     if (e.dir) init.cwd = e.dir
 
+    // Ou et sur quoi la tache a tourne : la ligne que personne n'avait, et sans
+    // laquelle un checkout en retard produit une conclusion fausse sans trace
+    const whereLine =
+      'ou: ' +
+      [
+        checkout.dir || '(repertoire inconnu)',
+        checkout.commit ? '@ ' + checkout.commit : '(hors depot git)',
+        checkout.branch ? '(' + checkout.branch + ')' : null,
+        checkout.commit ? (checkout.isDirty ? 'checkout sale' : 'checkout propre') : null,
+      ]
+        .filter(Boolean)
+        .join(' ')
+    const behindLine = checkout.behind
+      ? '/!\\ ce checkout est ' +
+        checkout.behind +
+        " commit(s) derriere son amont : la tache a lu un etat en retard. Peser la conclusion en consequence, et verifier sur un checkout a jour avant d'en tirer quoi que ce soit."
+      : null
+
+    const footer = () =>
+      [
+        task.sessionId ? 'session opencode: ' + task.sessionId : null,
+        'modele: ' + model,
+        'mode: ' + (mayWrite ? 'ecriture autorisee par l\'utilisateur' : 'lecture seule (agent plan)'),
+        'duree: ' + duration(task),
+        task.cost ? 'cout: ' + money(task.cost) : null,
+        task.toolCount ? 'outils: ' + task.toolCount + ' appels' : null,
+      ]
+        .filter(Boolean)
+        .join(' · ')
+
+    // Ce qui est rendu quand la tache s'arrete sans conclusion : la cause, ce
+    // qu'opencode avait deja produit, et ou ca a tourne
+    const giveUp = async (stop, detail) => {
+      poll.cancel()
+      task.status = 'failed'
+      task.stop = stop
+      task.endedAt = Date.now()
+      if (detail) task.error = detail
+
+      // La session garde ce que `$.process.run` a jete en tuant le processus
+      let found = task.sessionId
+      if (!found && !e.resume) found = await findSession($, task.startedAt - 2_000, targetDir)
+      const partial = await recoverPartial($, found)
+      if (found) task.sessionId = found
+      if (partial && partial.tools.length) task.toolCount = partial.tools.length
+      $.ui.invalidate('ui.render')
+      $.ui.toast('opencode: ' + STOPS[stop].word + ' en ' + duration(task))
+
+      const body = [STOPS[stop].line(task)]
+      if (detail) body.push('Detail : ' + detail)
+      if (partial && partial.error) body.push("Derniere erreur enregistree par la session : " + partial.error)
+      if (partial && partial.text) {
+        body.push('', "Ce qu'opencode avait deja produit, relu dans sa session :", '', partial.text)
+      } else {
+        body.push('', "La session d'opencode ne garde aucun texte : il n'avait rien conclu avant l'arret.")
+      }
+      if (partial && partial.tools.length) {
+        body.push('', 'Outils appeles avant l\'arret : ' + partial.tools.join(', '))
+      }
+      body.push('', '---', footer(), whereLine)
+      if (behindLine) body.push(behindLine)
+
+      // Un tour abandonne a deja repris sans nous : le resultat de l'outil ne va
+      // plus nulle part, et le transcript est la seule voie qui reste pour rendre
+      // a l'utilisateur ce qu'il a paye
+      if (stop === 'abandoned' && partial && partial.text) {
+        $.ui.log(
+          'opencode (tache abandonnee, texte retrouve dans la session ' +
+            (task.sessionId || '?') +
+            ') :\n' +
+            partial.text.slice(0, LOG_EXCERPT),
+        )
+      }
+      return { result: body.join('\n') }
+    }
+
+    // Un chronometre sur le budget : s'il s'est declenche avant que
+    // `$.process.run` rejette, c'est que le processus a tenu jusqu'au bout et
+    // que c'est le budget qui l'a tue. Sans lui, les trois rejets possibles de
+    // `$.process.run` — budget epuise, commande qui ne demarre pas, evenement
+    // abandonne — se ressemblent tous.
+    let isOutOfBudget = false
+    const fuse = $.clock.after(timeoutMs, () => {
+      isOutOfBudget = true
+    })
+
     let run
     try {
       run = await $.process.run(argv, init)
     } catch (err) {
-      poll.cancel()
-      task.status = 'failed'
-      task.endedAt = Date.now()
-      task.error = err.message
-      $.ui.invalidate('ui.render')
-      $.ui.toast('opencode: echec')
-      return { result: "opencode n'a pas pu finir la tache: " + err.message }
+      fuse.cancel()
+      const stop = isAbandoned || isAborted(next) ? 'abandoned' : isOutOfBudget ? 'budget' : 'start'
+      return giveUp(stop, err.message)
     }
+    fuse.cancel()
     poll.cancel()
 
     const parsed = parseEvents(run.stdout)
@@ -655,30 +807,35 @@ export function register(on) {
     if (!task.sessionId && parsed.sessionId) task.sessionId = parsed.sessionId
     task.toolCount = parsed.toolCalls.length
     task.lastTool = parsed.toolCalls.length ? parsed.toolCalls[parsed.toolCalls.length - 1].tool : null
-    task.status = parsed.errors.length || run.exitCode !== 0 ? 'failed' : 'done'
-    $.ui.invalidate('ui.render')
-    $.ui.toast(
-      'opencode: ' + (task.status === 'done' ? 'termine' : 'echec') + ' en ' + duration(task),
-    )
 
-    const footer = [
-      task.sessionId ? 'session opencode: ' + task.sessionId : null,
-      'modele: ' + model,
-      'mode: ' + (mayWrite ? 'ecriture autorisee par l\'utilisateur' : 'lecture seule (agent plan)'),
-      'duree: ' + duration(task),
-      task.cost ? 'cout: ' + money(task.cost) : null,
-      parsed.toolCalls.length ? 'outils: ' + parsed.toolCalls.length + ' appels' : null,
-    ]
-      .filter(Boolean)
-      .join(' · ')
-
-    if (task.status === 'failed') {
-      const why = parsed.errors.join(' | ') || run.stderr.trim() || 'code de sortie ' + run.exitCode
-      return { result: 'opencode a echoue: ' + why + '\n\n' + footer }
+    if (parsed.errors.length || run.exitCode !== 0) {
+      // Une erreur `provider.*` ne vient pas de la tache : relancer a
+      // l'identique redonnera la meme chose, et Claude doit le savoir
+      const isProvider = parsed.errors.some((err) => err.type.startsWith('provider'))
+      const why =
+        parsed.errors.map((err) => err.message).join(' | ') ||
+        run.stderr.trim() ||
+        'code de sortie ' + run.exitCode
+      task.status = 'failed'
+      task.stop = isProvider ? 'provider' : 'run'
+      task.error = why
+      $.ui.invalidate('ui.render')
+      $.ui.toast('opencode: ' + STOPS[task.stop].word + ' en ' + duration(task))
+      const body = [STOPS[task.stop].line(task), 'Detail : ' + why]
+      if (parsed.text) body.push('', "Ce qu'opencode avait produit avant l'erreur :", '', parsed.text)
+      body.push('', '---', footer(), whereLine)
+      if (behindLine) body.push(behindLine)
+      return { result: body.join('\n') }
     }
 
+    task.status = 'done'
+    $.ui.invalidate('ui.render')
+    $.ui.toast('opencode: termine en ' + duration(task))
+
     const answer = parsed.text || '(opencode a fini sans texte de reponse)'
-    return { result: answer + '\n\n---\n' + footer }
+    const tail = ['', '---', footer(), whereLine]
+    if (behindLine) tail.push(behindLine)
+    return { result: answer + tail.join('\n') }
   }).catch(async ($, e, next) => {
     // Sans ce gestionnaire, un hook qui echoue est simplement saute et l'outil
     // reste sans reponse : on rend l'echec lisible pour Claude
@@ -777,9 +934,19 @@ export function register(on) {
       const model = shortModel(task.model)
       // Ce que la tache avait le droit de faire, lisible d'un coup d'oeil
       const scope = task.mayWrite ? 'ecriture' : 'lecture'
-      const time = duration(task)
+      // En cours, le budget restant est colle a la duree : on voit venir la
+      // coupe au lieu de la subir. Fini, il ne veut plus rien dire.
+      const time = [duration(task), remaining(task)].filter(Boolean).join('  ')
       const head = task.title || model
-      const meta = [task.title ? model : null, scope, money(task.cost)].filter(Boolean).join('  ')
+      const meta = [
+        task.title ? model : null,
+        scope,
+        // Pourquoi la tache s'est arretee, quand elle s'est mal arretee
+        task.stop ? STOPS[task.stop].word : null,
+        money(task.cost),
+      ]
+        .filter(Boolean)
+        .join('  ')
       return Box({
         key: 'task-' + task.id,
         flexDirection: 'column',
