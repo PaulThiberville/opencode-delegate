@@ -98,6 +98,8 @@ let catalog = null
 let notice = null
 // Quelles sections du pane sont repliees
 let folded = { running: false, done: false }
+// Quelles cartes montrent le detail de leurs appels d'outils
+let openCalls = {}
 // Ce que le preflight a trouve ; `reason` est deja une phrase pour l'utilisateur
 let opencode = { isReady: false, version: null, reason: "opencode n'a pas encore ete sonde" }
 // Quand la question d'autorisation d'ecriture en cours a ete posee, 0 s'il n'y
@@ -184,7 +186,7 @@ async function findSession($, since, dir) {
 
 function parseEvents(stdout) {
   const texts = new Map() // id de part -> texte, le dernier gagne
-  const toolCalls = []
+  const toolCalls = new Map()
   const errors = []
   let sessionId
 
@@ -202,8 +204,16 @@ function parseEvents(stdout) {
     if (event.type === 'text' && typeof part.text === 'string') {
       texts.set(part.id || 'text-' + texts.size, part.text)
     } else if (event.type === 'tool_use' && part.tool) {
-      const status = (part.state && part.state.status) || 'unknown'
-      toolCalls.push({ tool: part.tool, status })
+      const state = part.state || {}
+      const time = state.time || {}
+      // un meme appel est emis plusieurs fois au fil de son avancement :
+      // la derniere version gagne
+      toolCalls.set(part.id || 'tool-' + toolCalls.size, {
+        tool: part.tool,
+        status: state.status || 'unknown',
+        title: state.title || part.tool,
+        ms: time.start && time.end ? time.end - time.start : null,
+      })
     } else if (event.type === 'error') {
       const error = event.error || {}
       errors.push({
@@ -213,7 +223,12 @@ function parseEvents(stdout) {
     }
   }
 
-  return { text: [...texts.values()].join('\n').trim(), toolCalls, errors, sessionId }
+  return {
+    text: [...texts.values()].join('\n').trim(),
+    toolCalls: [...toolCalls.values()],
+    errors,
+    sessionId,
+  }
 }
 
 // `$.process.run` ne rend rien du tout quand il tue le processus : tout ce
@@ -335,9 +350,29 @@ function clock(total) {
   return minutes + 'm' + seconds
 }
 
+// La carte represente une session opencode, pas un appel : une reprise ajoute
+// un segment a la meme carte, et la duree affichee est leur somme
 function elapsed(task) {
-  const end = task.endedAt || Date.now()
-  return Math.round((end - task.startedAt) / 1000)
+  const segments = task.segments || [{ startedAt: task.startedAt, endedAt: task.endedAt }]
+  const total = segments.reduce((sum, seg) => sum + ((seg.endedAt || Date.now()) - seg.startedAt), 0)
+  return Math.round(total / 1000)
+}
+
+// Ce qu'opencode a consomme sur toute la session, tel que le serveur le compte
+function tokens(task) {
+  const t = task.tokens
+  if (!t) return ''
+  const used = (t.input || 0) + (t.output || 0) + (t.reasoning || 0)
+  if (!used) return ''
+  const label = used >= 1000 ? (used / 1000).toFixed(1) + 'k' : String(used)
+  return label + ' tokens'
+}
+
+// Fin du segment en cours : c'est lui qui alimente la duree cumulee
+function closeSegment(task) {
+  const segments = task.segments || []
+  const last = segments[segments.length - 1]
+  if (last && !last.endedAt) last.endedAt = Date.now()
 }
 
 function duration(task) {
@@ -648,24 +683,28 @@ export function register(on) {
     // Claude rouvrirait l'ecriture par la porte de derriere
     const agent = mayWrite ? e.agent : PLAN_AGENT
 
-    const task = {
-      id: ++seq,
+    // Une reprise continue la meme carte : l'unite affichee est la session
+    // opencode, pas l'appel d'outil. Deux cartes au meme titre ne disaient rien
+    // de plus que « c'est la meme conversation ».
+    const resumed = e.resume ? tasks.find((item) => item.sessionId === e.resume) : null
+    const task = resumed || { id: ++seq, toolCalls: [], segments: [], runs: 0, cuts: 0, cost: 0, tokens: null }
+    Object.assign(task, {
       prompt,
       model,
       agent,
       mayWrite,
-      sessionId,
+      sessionId: sessionId || task.sessionId,
       status: 'running',
       startedAt: Date.now(),
       timeoutMs,
       checkout,
       stop: null,
-      cost: 0,
-      tokens: null,
-      lastTool: null,
-      toolCount: 0,
-    }
-    tasks.unshift(task)
+      error: undefined,
+    })
+    task.runs += 1
+    task.segments.push({ startedAt: task.startedAt })
+    // la reprise repasse la carte en tete, et dans « En cours »
+    tasks = resumed ? [task, ...tasks.filter((item) => item !== task)] : [task, ...tasks]
 
     await $.ui.open({ id: PANE, title: 'opencode' })
     $.ui.invalidate('ui.render')
@@ -756,7 +795,9 @@ export function register(on) {
       poll.cancel()
       task.status = 'failed'
       task.stop = stop
+      task.cuts += 1
       task.endedAt = Date.now()
+      closeSegment(task)
       if (detail) task.error = detail
 
       // La session garde ce que `$.process.run` a jete en tuant le processus
@@ -764,7 +805,10 @@ export function register(on) {
       if (!found && !e.resume) found = await findSession($, task.startedAt - 2_000, targetDir)
       const partial = await recoverPartial($, found)
       if (found) task.sessionId = found
-      if (partial && partial.tools.length) task.toolCount = partial.tools.length
+      if (partial && partial.tools.length) {
+        task.toolCalls = [...task.toolCalls, ...partial.tools]
+        task.toolCount = task.toolCalls.length
+      }
       $.ui.invalidate('ui.render')
       $.ui.toast('opencode: ' + STOPS[stop].word + ' en ' + duration(task))
 
@@ -820,8 +864,10 @@ export function register(on) {
 
     const parsed = parseEvents(run.stdout)
     task.endedAt = Date.now()
+    closeSegment(task)
     if (!task.sessionId && parsed.sessionId) task.sessionId = parsed.sessionId
-    task.toolCount = parsed.toolCalls.length
+    task.toolCalls = [...task.toolCalls, ...parsed.toolCalls]
+    task.toolCount = task.toolCalls.length
     task.lastTool = parsed.toolCalls.length ? parsed.toolCalls[parsed.toolCalls.length - 1].tool : null
 
     if (parsed.errors.length || run.exitCode !== 0) {
@@ -834,6 +880,7 @@ export function register(on) {
         'code de sortie ' + run.exitCode
       task.status = 'failed'
       task.stop = isProvider ? 'provider' : 'run'
+      task.cuts += 1
       task.error = why
       $.ui.invalidate('ui.render')
       $.ui.toast('opencode: ' + STOPS[task.stop].word + ' en ' + duration(task))
@@ -949,21 +996,54 @@ export function register(on) {
       // reussite dans la liste des terminees.
       const color = isRunning ? 'blue' : task.status === 'done' ? 'green' : 'red'
       const model = shortModel(task.model)
-      // Ce que la tache avait le droit de faire, lisible d'un coup d'oeil
-      const scope = task.mayWrite ? 'ecriture' : 'lecture'
       // En cours, le budget restant est colle a la duree : on voit venir la
       // coupe au lieu de la subir. Fini, il ne veut plus rien dire.
       const time = [duration(task), remaining(task)].filter(Boolean).join('  ')
       const head = task.title || model
+      // La seconde ligne dit le modele et ce qu'il a consomme. Le reste n'y
+      // apparait qu'a l'exception pres : une ecriture, ou un arret subi.
       const meta = [
-        task.title ? model : null,
-        scope,
-        // Pourquoi la tache s'est arretee, quand elle s'est mal arretee
+        model,
+        tokens(task),
+        task.mayWrite ? 'ecriture' : null,
         task.stop ? STOPS[task.stop].word : null,
-        money(task.cost),
       ]
         .filter(Boolean)
         .join('  ')
+
+      const calls = task.toolCalls || []
+      const isOpen = openCalls[task.id]
+      const history = [
+        calls.length + (calls.length > 1 ? ' appels' : ' appel'),
+        task.runs > 1 ? task.runs + ' reprises' : null,
+        task.cuts ? task.cuts + (task.cuts > 1 ? ' coupures' : ' coupure') : null,
+      ]
+        .filter(Boolean)
+        .join(' \u00b7 ')
+
+      // Le detail des appels, replie par defaut comme les sous-taches du
+      // panneau natif
+      const rows = !isOpen
+        ? []
+        : calls.slice(0, 12).map((call, index) => {
+            const span = call.ms == null ? '' : call.ms < 1000 ? call.ms + 'ms' : clock(Math.round(call.ms / 1000))
+            return Box({
+              key: 'call-' + task.id + '-' + index,
+              flexDirection: 'row',
+              justifyContent: 'space-between',
+              columnGap: 1,
+              children: [
+                Text({ dimColor: true, children: [fit(call.title || call.tool, Math.max(inner - span.length - 4, 8))] }),
+                Text({ dimColor: true, children: [span] }),
+              ],
+            })
+          })
+      if (isOpen && calls.length > 12) {
+        rows.push(
+          Text({ key: 'call-more-' + task.id, dimColor: true, children: ['\u2026 et ' + (calls.length - 12) + ' autres'] }),
+        )
+      }
+
       return Box({
         key: 'task-' + task.id,
         flexDirection: 'column',
@@ -988,6 +1068,21 @@ export function register(on) {
               Text({ dimColor: true, children: [fit(meta, inner - 2)] }),
             ],
           }),
+          ...(calls.length
+            ? [
+                Button({
+                  key: 'calls-' + task.id,
+                  label: history + ' ' + (isOpen ? '\u2304' : '\u203a'),
+                  plain: true,
+                  dimColor: true,
+                  onPress: () => {
+                    openCalls[task.id] = !openCalls[task.id]
+                    redraw()
+                  },
+                }),
+                ...rows,
+              ]
+            : []),
         ],
       })
     }

@@ -33,27 +33,36 @@ Mod Claude Code qui utilise **opencode 2** comme sous-agent.
 ```
 Modele  opencode/glm-5.3-flash-free
 
-Autre   provider/model (457 au catalogue)
+Autre   provider/model (458 au catalogue)
 
 En cours 1 ⌄
-╭────────────────────────────────────────╮
-│ Refactor du module auth   1m12  reste 3m48│
-│ ▸ kimi-k2.7-code  ecriture  $0.0032    │
-╰────────────────────────────────────────╯
+╭──────────────────────────────────────────╮
+│ Parité clés i18n fr/en apps/mobile  6m02 │
+│ ▸ glm-5.3-flash-free  12.4k tokens       │
+│ 15 appels · 2 reprises · 1 coupure ⌄     │
+│   read taxonomy.ts                  420ms│
+│   grep "t(" apps/mobile                3s│
+╰──────────────────────────────────────────╯
 
 Terminees 3 ›
 
 4 taches · $0.0043
 ```
 
-Une tâche par carte, calquée sur le panneau « tâches en arrière-plan » de
-Claude Code : le titre qu'opencode a donné à sa session et la durée sur la
-première ligne, puis le modèle, la portée (`lecture` ou `ecriture`) et le coût
-en seconde ligne, estompés. Le début du prompt n'est jamais affiché — c'est du
-transcript, illisible en une ligne ; tant qu'opencode n'a pas nommé sa session,
-le modèle prend la place du titre. La bordure est neutre : le statut tient dans
-le glyphe, seul signe qui distingue un échec d'une réussite parmi les terminées,
-et dans la section qui porte la carte.
+Une carte par **session opencode**, pas par appel : une reprise avec `resume`
+repasse la même carte en « En cours » et lui ajoute un segment, au lieu d'en
+créer une seconde au même titre. Trois lignes, sur le modèle du panneau
+« tâches en arrière-plan » de Claude Code : le titre de la session et sa durée
+cumulée ; le modèle et les tokens consommés sur toute la session ; puis le
+nombre d'appels d'outils, dépliable pour voir chacun avec sa durée. Le début du
+prompt n'est jamais affiché — c'est du transcript, illisible en une ligne ;
+tant qu'opencode n'a pas nommé sa session, le modèle prend la place du titre.
+La seconde ligne ne mentionne `ecriture` que lorsque l'écriture a été
+autorisée, la lecture seule étant le défaut, et la cause d'arrêt seulement
+quand il y en a une. La troisième compte les reprises et les coupures, pour
+qu'une session recousue garde la trace de ce qui l'a interrompue. La bordure
+est neutre : le statut tient dans le glyphe et dans la section qui porte la
+carte.
 
 Tant que la tâche tourne, la première ligne porte aussi le **budget restant**
 (`reste 3m48`) : on voit venir la coupe au lieu de la subir, et on peut ouvrir

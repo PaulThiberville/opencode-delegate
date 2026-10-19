@@ -5,7 +5,7 @@ const TOOL = 'mcp__opencode-delegate__delegate'
 // Le flux NDJSON reel d'un `opencode run --format json`, abrege
 const RUN_STDOUT = [
   '{"type":"step_start","timestamp":1,"sessionID":"SID","part":{"id":"p0","type":"step-start"}}',
-  '{"type":"tool_use","timestamp":2,"sessionID":"SID","part":{"id":"p1","type":"tool","tool":"read","state":{"status":"completed","input":{"path":"a.txt"},"output":"1: hello"}}}',
+  '{"type":"tool_use","timestamp":2,"sessionID":"SID","part":{"id":"p1","type":"tool","tool":"read","state":{"status":"completed","title":"read a.txt","input":{"path":"a.txt"},"output":"1: hello","time":{"start":1000,"end":1420}}}}',
   '{"type":"step_finish","timestamp":3,"sessionID":"SID","part":{"id":"p2","type":"step-finish"}}',
   '{"type":"text","timestamp":4,"sessionID":"SID","part":{"id":"p3","type":"text","text":"hello"}}',
 ].join('\n')
@@ -404,4 +404,49 @@ test('la bordure des cartes est neutre, le statut tient dans le glyphe', async (
   // le glyphe reste colore : c'est lui qui separe un echec d'une reussite
   expect(await ui.find({ type: 'Text', text: '✓' })).toBeDefined()
   await ui.unmount()
+})
+
+test('une reprise continue la meme carte au lieu d\'en creer une seconde', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  stubEngine(on, clock, new Map())
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await runTask($, clock)
+  await runTask($, clock, { resume: SERVER_SID })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  // une seule carte, celle de la session, et pas deux au meme titre
+  expect(await ui.find({ key: 'task-1' })).toBeDefined()
+  expect(await ui.find({ key: 'task-2' })).toBeUndefined()
+  // elle porte l'historique de la session entiere, sur son bouton de detail
+  const history: any = await ui.find({ key: 'calls-1' })
+  expect(history.props.label).toContain('2 appels')
+  expect(history.props.label).toContain('2 reprises')
+  await ui.unmount()
+})
+
+test('la carte montre les tokens et deplie ses appels', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  stubEngine(on, clock, new Map())
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await runTask($, clock)
+
+  for (const surface of ['terminal', 'desktop', 'vscode'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ type: 'Text', text: 'dessine par le moteur' })).toBeUndefined()
+    // 518 entrants + 334 sortants, tels que le serveur les compte
+    expect(await ui.find({ type: 'Text', text: /852 tokens/ })).toBeDefined()
+
+    // replie par defaut : le detail n'est pas la
+    expect(await ui.find({ type: 'Text', text: 'read a.txt' })).toBeUndefined()
+    await ui.press({ key: 'calls-1' })
+    expect(await ui.find({ type: 'Text', text: 'read a.txt' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '420ms' })).toBeDefined()
+    await ui.press({ key: 'calls-1' })
+    expect(await ui.find({ type: 'Text', text: 'read a.txt' })).toBeUndefined()
+    await ui.unmount()
+  }
 })

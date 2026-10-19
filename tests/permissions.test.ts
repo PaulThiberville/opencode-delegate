@@ -241,7 +241,7 @@ test('une seconde delegation en lecture seule passe pendant une question', async
   await first
 })
 
-test('le pane dit de chaque tache ce qu\'elle avait le droit de faire', async ($, on) => {
+test("le pane ne signale que l'ecriture, la lecture etant le defaut", async ($, on) => {
   const clock = mock.clock(on)
   mock.env(on, {})
   stub(on, { answer: ALLOW })
@@ -267,8 +267,10 @@ test('le pane dit de chaque tache ce qu\'elle avait le droit de faire', async ($
       },
     })
     expect(await ui.find({ type: 'Text', text: 'dessine par le moteur' })).toBeUndefined()
-    expect(await ui.find({ type: 'Text', text: 'lecture' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'ecriture' })).toBeDefined()
+    // la carte en ecriture le dit ; celle en lecture seule n'alourdit pas la
+    // ligne avec le cas nominal
+    expect(await ui.find({ type: 'Text', text: /ecriture/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /\blecture\b/ })).toBeUndefined()
     await ui.unmount()
   }
 })
