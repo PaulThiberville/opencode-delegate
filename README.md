@@ -24,9 +24,9 @@ Mod Claude Code qui utilise **opencode 2** comme sous-agent.
 - Nomme dans chaque résultat **où et sur quoi** la tâche a tourné : répertoire
   effectif, commit de départ, état du checkout, et un avertissement quand le
   checkout est en retard sur son amont.
-- Quand la tâche s'arrête sans conclure, **dit pourquoi** et rend quand même ce
-  qu'opencode avait déjà produit : voir [Quand la tâche s'arrête
-  mal](#quand-la-tâche-sarrête-mal).
+- Quand la tâche s'arrête sans conclure, **dit pourquoi**, rend quand même ce
+  qu'opencode avait déjà produit, et rend l'id de session pour reprendre par
+  `resume` : voir [Quand la tâche s'arrête mal](#quand-la-tâche-sarrête-mal).
 
 ## Le pane
 
@@ -153,6 +153,20 @@ sans ça le journal d'outils se lit à l'envers.
 
 Quand la session ne garde aucun texte, le résultat le dit, au lieu de laisser
 croire qu'opencode n'a rien trouvé.
+
+### Et comment reprendre
+
+Un échec rend l'**id de session opencode** et dit explicitement que `resume` le
+reprend. Ça a l'air secondaire, c'est ce qui change le plus : le plafond de dix
+minutes porte sur **un appel** de `$.process.run`, pas sur une tâche. La session
+opencode garde tout son historique, donc une tâche longue se mène en plusieurs
+reprises — à condition que Claude ait l'id. Sans lui, la chaîne casse à la
+première coupure et le mod a l'air incapable de tenir une tâche longue, alors
+qu'il attendait juste qu'on lui repasse l'id.
+
+Quand la session n'a **pas** été retrouvée, le résultat le dit aussi, plutôt que
+de laisser croire à une reprise possible : il n'y a alors rien d'autre à faire
+que relancer depuis le début. Les deux cas sont verrouillés par un test.
 
 **Cas particulier de l'abandon :** un tour abandonné a déjà repris sans nous, et
 le résultat de l'outil ne va plus nulle part. Le texte retrouvé est donc aussi

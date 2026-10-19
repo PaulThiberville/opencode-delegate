@@ -39,6 +39,9 @@ type Shape = {
   // suite, ou rendre une sortie
   run: 'budget' | 'start' | { exitCode: number; stdout: string; stderr?: string }
   messages?: unknown[]
+  // si `session.list` retrouve la session de la tache ; sans elle, il n'y a ni
+  // sortie partielle a relire ni id a rendre pour une reprise
+  found?: boolean
 }
 
 function stub(on: any, clock: any, shape: Shape) {
@@ -75,7 +78,10 @@ function stub(on: any, clock: any, shape: Shape) {
       return { value: { exitCode: 0, stdout: JSON.stringify({ data }), stderr: '' } }
     }
     if (argv[2] === 'session.list') {
-      const items = [{ id: SERVER_SID, time: { created: Date.now() }, location: { directory: '/work' } }]
+      const items =
+        shape.found === false
+          ? []
+          : [{ id: SERVER_SID, time: { created: Date.now() }, location: { directory: '/work' } }]
       return { value: { exitCode: 0, stdout: JSON.stringify({ data: items }), stderr: '' } }
     }
     if (argv[1] === 'api') {
@@ -218,3 +224,52 @@ test('la carte du pane nomme la cause de l\'arret', async ($, on) => {
 // traitement est le seul a ne jamais conseiller de relancer, et le seul a
 // recopier le texte retrouve dans le transcript par `$.ui.log` — le resultat de
 // l'outil ne va plus nulle part une fois le tour abandonne.
+
+test('un echec rend l\'id de session et dit comment reprendre', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  stub(on, clock, { run: 'budget' })
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  const out: any = await runTask($, clock, { budgetMs: BUDGET })
+
+  // sans l'id, la chaine casse a la premiere coupure : une tache longue aurait
+  // l'air hors de portee du mod, alors que le budget plafonne un appel, pas une
+  // tache
+  expect(out.result).toContain('Reprise possible')
+  expect(out.result).toContain('resume: "' + SERVER_SID + '"')
+  expect(out.result).toContain('plafonne un appel, pas une tache')
+})
+
+test('un echec sans session retrouvee ne pretend pas a une reprise', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  stub(on, clock, { run: 'budget', found: false })
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  const out: any = await runTask($, clock, { budgetMs: BUDGET })
+
+  expect(out.result).toContain('Pas de reprise possible')
+  expect(out.result).not.toContain('Reprise possible :')
+  // et surtout aucun id invente
+  expect(out.result).not.toContain('session opencode:')
+  expect(out.result).not.toContain(SERVER_SID)
+})
+
+test("une erreur de fournisseur rend aussi l'id lu dans le flux", async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  stub(on, clock, {
+    run: {
+      exitCode: 1,
+      stdout:
+        '{"type":"error","timestamp":1,"sessionID":"ses_dufluxabc","error":{"type":"provider.auth","message":"This API key has expired."}}',
+    },
+  })
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  const out: any = await runTask($, clock)
+
+  // meme une fois le fournisseur regle, la reprise se fait sur la meme session
+  expect(out.result).toContain('resume: "ses_dufluxabc"')
+})
