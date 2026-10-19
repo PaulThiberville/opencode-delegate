@@ -20,6 +20,21 @@ const MAX_RECENT_MODELS = 6
 // moteur dessine son propre pane vide. Le champ de saisie couvre le reste.
 const MAX_OPTIONS = 64
 
+// Version minimale d'opencode : `opencode run --format json` et `opencode api`
+// n'existent qu'en 2.x
+const MIN_MAJOR = 2
+// Le preflight bloque le premier prompt, donc il tient en quelques secondes
+const PROBE_MS = 5_000
+
+// Les libelles de la question d'autorisation. `$.ui.ask` rend le libelle choisi
+// tel quel, donc on les compare a l'identique.
+const ALLOW = "Autoriser l'ecriture"
+const READ_ONLY = 'Lecture seule'
+const CANCEL = 'Annuler'
+
+// L'agent opencode en lecture seule, le mode par defaut de toute delegation
+const PLAN_AGENT = 'plan'
+
 // Les taches de la session, la plus recente en premier
 let tasks = []
 let seq = 0
@@ -34,6 +49,52 @@ let catalog = null
 let notice = null
 // Quelles sections du pane sont repliees
 let folded = { running: false, done: false }
+// Ce que le preflight a trouve ; `reason` est deja une phrase pour l'utilisateur
+let opencode = { isReady: false, version: null, reason: "opencode n'a pas encore ete sonde" }
+
+// Sonde `opencode --version` avant d'enregistrer quoi que ce soit. `$.process.run`
+// rejette si le binaire ne demarre pas, d'ou le try/catch ; un code de sortie non
+// nul, lui, revient dans le resultat.
+async function probeOpencode($) {
+  let out
+  try {
+    out = await $.process.run(['opencode', '--version'], { timeoutMs: PROBE_MS })
+  } catch (err) {
+    return {
+      isReady: false,
+      version: null,
+      reason: "le binaire `opencode` est introuvable ou ne demarre pas (" + err.message + ')',
+    }
+  }
+  if (out.exitCode !== 0) {
+    return {
+      isReady: false,
+      version: null,
+      reason: '`opencode --version` a repondu en erreur (code ' + out.exitCode + ')',
+    }
+  }
+  // « opencode v2.0.32 », et on accepte toute mise en forme autour du numero
+  const found = /(\d+)\.(\d+)(?:\.(\d+))?/.exec(out.stdout + '\n' + out.stderr)
+  if (!found) {
+    return {
+      isReady: false,
+      version: null,
+      reason: '`opencode --version` ne donne pas de numero de version lisible',
+    }
+  }
+  const version = found[0]
+  if (Number(found[1]) < MIN_MAJOR) {
+    return {
+      isReady: false,
+      version,
+      reason: 'opencode ' + version + ' est trop ancien : la delegation demande une 2.x',
+    }
+  }
+  return { isReady: true, version, reason: null }
+}
+
+// Ce que l'utilisateur doit faire, quand l'outil n'a pas ete enregistre
+const FIX = 'Installer opencode 2.x (https://opencode.ai), puis relancer la session.'
 
 // Le palier gratuit d'OpenCode Console refuse une session dont l'id n'a pas ete
 // emis par opencode : il lit un id invente comme un appel « hors d'OpenCode »
@@ -163,52 +224,74 @@ export function register(on) {
       rememberModel(fromEnv)
     }
 
-    await $.tool.register({
-      name: 'delegate',
-      description: [
-        'Delegue une tache autonome a opencode, un autre agent de code qui tourne',
-        'sur ses propres modeles (moins chers que ceux de cette session).',
-        'A utiliser pour une tache bien delimitee et descriptible en texte :',
-        'exploration, refactor mecanique, ecriture de tests, resume de code.',
-        'opencode travaille dans le meme depot et ECRIT dans les fichiers, avec',
-        'les permissions auto-approuvees : ne pas deleguer une tache dont le',
-        'perimetre de fichiers est flou.',
-        "L'outil rend la reponse finale d'opencode, plus l'id de session a passer",
-        'dans `resume` pour un suivi sur la meme conversation opencode.',
-      ].join(' '),
-      inputSchema: {
-        type: 'object',
-        properties: {
-          prompt: {
-            type: 'string',
-            description:
-              "La consigne complete pour opencode. Il ne voit rien de cette conversation : tout le contexte necessaire doit etre dans ce texte.",
+    // Preflight : sans opencode 2.x, l'outil n'est pas enregistre du tout.
+    // Le proposer quand meme ferait appeler par Claude un outil qui ne peut que
+    // echouer, au prix d'un tour de modele et d'une erreur illisible.
+    opencode = await probeOpencode($)
+    if (!opencode.isReady) {
+      $.ui.log('delegation vers opencode desactivee : ' + opencode.reason + ' ' + FIX)
+    }
+
+    if (opencode.isReady) {
+      await $.tool.register({
+        name: 'delegate',
+        description: [
+          'Delegue une tache autonome a opencode, un autre agent de code qui tourne',
+          'sur ses propres modeles (moins chers que ceux de cette session).',
+          'A utiliser pour une tache bien delimitee et descriptible en texte :',
+          'exploration, refactor mecanique, ecriture de tests, resume de code.',
+          "Par defaut la tache part en LECTURE SEULE (agent `plan` d'opencode) :",
+          'opencode lit le depot et rend un compte rendu, mais ne modifie aucun',
+          'fichier. Pour une tache qui doit ecrire, passer `writeFiles: true` :',
+          "l'utilisateur est alors interroge et doit autoriser l'ecriture lui-meme,",
+          "sans quoi la delegation n'a pas lieu. Ne pas passer `writeFiles` pour",
+          'une tache dont le perimetre de fichiers est flou.',
+          "L'outil rend la reponse finale d'opencode, plus l'id de session a passer",
+          'dans `resume` pour un suivi sur la meme conversation opencode.',
+        ].join(' '),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            prompt: {
+              type: 'string',
+              description:
+                "La consigne complete pour opencode. Il ne voit rien de cette conversation : tout le contexte necessaire doit etre dans ce texte.",
+            },
+            writeFiles: {
+              type: 'boolean',
+              description:
+                "A passer a true seulement si la tache doit modifier des fichiers. L'utilisateur est alors interroge et doit autoriser l'ecriture ; s'il refuse ou ne repond pas, rien ne part. Sans ce champ, la tache tourne en lecture seule.",
+            },
+            model: {
+              type: 'string',
+              description:
+                "Modele au format provider/model. Par defaut, celui choisi dans le pane /opencode.",
+            },
+            agent: {
+              type: 'string',
+              description:
+                "Agent opencode a utiliser. Honore seulement si l'ecriture a ete autorisee ; en lecture seule, l'agent `plan` est impose.",
+            },
+            dir: {
+              type: 'string',
+              description:
+                'Repertoire de travail de la tache, absolu ou relatif a la session. Par defaut celui de la session.',
+            },
+            resume: {
+              type: 'string',
+              description:
+                "Id de session opencode rendu par un appel precedent, pour continuer la meme conversation.",
+            },
+            budgetMs: {
+              type: 'number',
+              description: 'Budget de temps en millisecondes, 300000 par defaut, 600000 au maximum.',
+            },
           },
-          model: {
-            type: 'string',
-            description:
-              "Modele au format provider/model. Par defaut, celui choisi dans le pane /opencode.",
-          },
-          agent: { type: 'string', description: "Agent opencode a utiliser, par exemple 'plan'." },
-          dir: {
-            type: 'string',
-            description:
-              'Repertoire de travail de la tache, absolu ou relatif a la session. Par defaut celui de la session.',
-          },
-          resume: {
-            type: 'string',
-            description:
-              "Id de session opencode rendu par un appel precedent, pour continuer la meme conversation.",
-          },
-          budgetMs: {
-            type: 'number',
-            description: 'Budget de temps en millisecondes, 300000 par defaut, 600000 au maximum.',
-          },
+          required: ['prompt'],
         },
-        required: ['prompt'],
-      },
-      isDeferred: false,
-    })
+        isDeferred: false,
+      })
+    }
 
     try {
       await $.command.register({
@@ -220,8 +303,9 @@ export function register(on) {
       $.ui.log('commande /opencode non enregistree: ' + err.message)
     }
 
-    // Le catalogue sert a valider une saisie libre ; il peut arriver en retard
-    $.clock.after(0, async () => {
+    // Le catalogue sert a valider une saisie libre ; il peut arriver en retard.
+    // Sans opencode, le pane n'affiche pas de selecteur : rien a charger.
+    if (opencode.isReady) $.clock.after(0, async () => {
       try {
         const listing = await $.process.run(['opencode', 'models'], { timeoutMs: 20_000 })
         if (listing.exitCode !== 0) return
@@ -240,6 +324,9 @@ export function register(on) {
   // Dit a Claude, des le premier message, que la delegation existe
   on('prompt.context', async ($, e, next) => {
     const below = await next(e)
+    // Sans outil enregistre, annoncer la capacite promettrait a Claude un outil
+    // qui n'existe pas
+    if (!opencode.isReady) return below
     const block = {
       name: 'opencodeDelegate',
       text: [
@@ -251,8 +338,12 @@ export function register(on) {
         'large de la codebase, refactor mecanique, ecriture de tests, resume de',
         "fichiers, verification repetitive. opencode ne voit rien de cette",
         'conversation : tout le contexte utile doit tenir dans le prompt envoye.',
-        'Il travaille dans le meme depot et ecrit dans les fichiers, donc ne pas',
-        'lui confier une tache dont le perimetre de fichiers est flou.',
+        '',
+        "Par defaut la delegation est en lecture seule : opencode lit le depot et",
+        "rend un compte rendu, sans toucher aux fichiers. Pour une tache qui doit",
+        'ecrire, passer `writeFiles: true` : la question part a l\'utilisateur, qui',
+        "autorise ou non ; sans son accord, rien ne tourne. Ne pas le passer pour",
+        'une tache dont le perimetre de fichiers est flou.',
       ].join('\n'),
     }
     return { blocks: [...below.blocks, block] }
@@ -267,15 +358,51 @@ export function register(on) {
     const model = e.model || defaultModel
     const timeoutMs = Math.min(Number(e.budgetMs) || DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS)
     const prompt = String(e.prompt || '')
+
+    // L'ecriture n'est jamais implicite : Claude la demande, l'utilisateur la
+    // donne. `$.ui.ask` rejette si la question est ecartee et dans un `claude -p`,
+    // ou personne ne peut repondre ; dans les deux cas rien ne part.
+    let mayWrite = false
+    if (e.writeFiles) {
+      const where = e.dir ? ' dans ' + e.dir : ''
+      let answer
+      try {
+        answer = await $.ui.ask(
+          'Laisser opencode ecrire dans les fichiers' + where + ' pour « ' + fit(prompt, 80) + ' » ?',
+          { options: [ALLOW, READ_ONLY, CANCEL], header: 'opencode' },
+        )
+      } catch (err) {
+        return {
+          result:
+            "La delegation demandait d'ecrire dans les fichiers, et personne n'a pu l'autoriser (" +
+            err.message +
+            '). Rien ne s\'est execute. Relancer sans `writeFiles` pour une tache en lecture seule.',
+        }
+      }
+      if (answer === ALLOW) mayWrite = true
+      else if (answer !== READ_ONLY) {
+        return {
+          result:
+            "L'utilisateur n'a pas autorise l'ecriture (reponse : " +
+            answer +
+            "). Rien ne s'est execute.",
+        }
+      }
+    }
     // Sans id, la tache tourne quand meme : on le lira dans le flux a la fin,
     // au prix du suivi live
     const sessionId = e.resume || (await createSession($, prompt.slice(0, 60)))
+
+    // En lecture seule, l'agent `plan` est impose : un `agent` libre choisi par
+    // Claude rouvrirait l'ecriture par la porte de derriere
+    const agent = mayWrite ? e.agent : PLAN_AGENT
 
     const task = {
       id: ++seq,
       prompt,
       model,
-      agent: e.agent,
+      agent,
+      mayWrite,
       sessionId,
       status: 'running',
       startedAt: Date.now(),
@@ -307,9 +434,13 @@ export function register(on) {
       $.ui.invalidate('ui.render')
     })
 
-    const argv = ['opencode', 'run', '--format', 'json', '--auto', '-m', model]
+    // `--auto` auto-approuve tout ce qui n'est pas explicitement refuse : il ne
+    // sort que pour une ecriture autorisee a l'instant par l'utilisateur. En
+    // lecture seule, l'agent `plan` n'a pas d'outil d'ecriture et rien a approuver.
+    const argv = ['opencode', 'run', '--format', 'json', '-m', model]
+    if (mayWrite) argv.push('--auto')
     if (sessionId) argv.push('--session', sessionId)
-    if (e.agent) argv.push('--agent', e.agent)
+    if (agent) argv.push('--agent', agent)
     argv.push(task.prompt)
 
     const init = { timeoutMs }
@@ -343,6 +474,7 @@ export function register(on) {
     const footer = [
       task.sessionId ? 'session opencode: ' + task.sessionId : null,
       'modele: ' + model,
+      'mode: ' + (mayWrite ? 'ecriture autorisee par l\'utilisateur' : 'lecture seule (agent plan)'),
       'duree: ' + duration(task),
       task.cost ? 'cout: ' + money(task.cost) : null,
       parsed.toolCalls.length ? 'outils: ' + parsed.toolCalls.length + ' appels' : null,
@@ -371,6 +503,20 @@ export function register(on) {
     // une carte mange deux colonnes de bordure et deux de padding
     const inner = Math.max(width - 4, 12)
     const redraw = () => $.ui.invalidate('ui.render')
+
+    // Sans opencode, ni selecteur de modele ni liste vide : le pane dit ce qui
+    // manque, puisque c'est la seule chose que l'utilisateur peut y faire
+    if (!opencode.isReady) {
+      return Box({
+        flexDirection: 'column',
+        rowGap: 1,
+        children: [
+          Text({ key: 'off', color: 'red', children: ['Delegation indisponible'] }),
+          Text({ key: 'why', wrap: 'wrap', children: [opencode.reason] }),
+          Text({ key: 'fix', dimColor: true, wrap: 'wrap', children: [FIX] }),
+        ],
+      })
+    }
 
     const choices = modelChoices()
     const picker = Select({
@@ -435,7 +581,9 @@ export function register(on) {
       const mark = isRunning ? '\u25b8' : task.status === 'done' ? '\u2713' : '\u2717'
       const color = isRunning ? 'blue' : task.status === 'done' ? 'green' : 'red'
       const metrics = [duration(task), money(task.cost)].filter(Boolean).join('  ')
-      const room = Math.max(inner - metrics.length - 2, 8)
+      // Ce que la tache avait le droit de faire, lisible d'un coup d'oeil
+      const scope = task.mayWrite ? 'ecriture' : 'lecture'
+      const room = Math.max(inner - metrics.length - scope.length - 3, 8)
       return Box({
         key: 'task-' + task.id,
         flexDirection: 'column',
@@ -453,6 +601,7 @@ export function register(on) {
                 children: [
                   Text({ color, children: [mark] }),
                   Text({ children: [fit(shortModel(task.model), room)] }),
+                  Text({ color: task.mayWrite ? 'yellow' : 'cyan', children: [scope] }),
                 ],
               }),
               Text({ dimColor: true, children: [metrics] }),
