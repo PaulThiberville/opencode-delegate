@@ -536,3 +536,20 @@ test('une tache en echec porte son titre en rouge', async ($, on) => {
   expect(title.props.color).toBe('red')
   await ui.unmount()
 })
+
+test('sans titre, le modele ne figure pas deux fois sur la carte', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  stubEngine(on, clock, new Map())
+  listFinds = false // pas de session retrouvee, donc pas de titre
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await runTask($, clock, { model: 'ollama-cloud/gpt-oss:20b' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const card: any = await ui.find({ key: 'task-1' })
+  const lines = JSON.stringify(card.children)
+  // le nom court du modele tient lieu de titre : une seule occurrence
+  expect(lines.split('gpt-oss:20b').length - 1).toBe(1)
+  await ui.unmount()
+})

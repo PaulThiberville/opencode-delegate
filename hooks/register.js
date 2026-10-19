@@ -1421,7 +1421,9 @@ export function register(on) {
       // La seconde ligne dit le modele et ce qu'il a consomme. Le reste n'y
       // apparait qu'a l'exception pres : une ecriture, ou un arret subi.
       const meta = [
-        model,
+        // sans titre, le modele tient deja la premiere ligne : l'y repeter ne
+        // dit rien de plus et fait une carte qui begaie
+        task.title ? model : null,
         tokens(task),
         task.mayWrite ? 'ecriture' : null,
         // une tache de fond ne rend rien a l'appel qui l'a lancee : le dire sur

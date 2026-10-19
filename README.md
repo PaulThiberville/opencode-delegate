@@ -61,7 +61,10 @@ cumulée, rien d'autre : le budget restant ne faisait qu'inquiéter pour rien,
 puisqu'une coupure se reprend par `resume` ; le modèle et les tokens consommés sur toute la session ; puis le
 nombre d'appels d'outils, dépliable pour voir chacun avec sa durée. Le début du
 prompt n'est jamais affiché — c'est du transcript, illisible en une ligne ;
-tant qu'opencode n'a pas nommé sa session, le modèle prend la place du titre.
+tant qu'opencode n'a pas nommé sa session, le modèle prend la place du titre,
+et la seconde ligne ne le répète alors pas. Ce titre vient d'opencode, pas du
+mod, qui ne fait que le lire : sa génération échoue par intermittence, surtout
+sur les modèles gratuits, donc une carte sans titre n'a rien d'anormal.
 La seconde ligne ne mentionne `ecriture` que lorsque l'écriture a été
 autorisée, la lecture seule étant le défaut, `fond` pour une délégation lancée
 en arrière-plan — dire où son résultat va arriver, puisqu'il ne revient pas à
