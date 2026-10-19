@@ -616,6 +616,10 @@ export function register(on) {
         borderColor: color,
         paddingX: 1,
         children: [
+          // Le titre que opencode donne a sa session, quand il est arrive. Le
+          // debut du prompt ne sert pas de repli : c'est du transcript, illisible
+          // en une ligne et sans interet une fois la tache lancee
+          ...(task.title ? [Text({ children: [fit(task.title, inner)] })] : []),
           Box({
             flexDirection: 'row',
             justifyContent: 'space-between',
@@ -625,14 +629,13 @@ export function register(on) {
                 columnGap: 1,
                 children: [
                   Text({ color, children: [mark] }),
-                  Text({ children: [fit(shortModel(task.model), room)] }),
+                  Text({ dimColor: true, children: [fit(shortModel(task.model), room)] }),
                   Text({ color: task.mayWrite ? 'yellow' : 'cyan', children: [scope] }),
                 ],
               }),
               Text({ dimColor: true, children: [metrics] }),
             ],
           }),
-          Text({ dimColor: true, children: [fit(task.title || task.prompt, inner)] }),
         ],
       })
     }
@@ -663,6 +666,8 @@ export function register(on) {
               Box({
                 key: 'cards-' + id,
                 flexDirection: 'column',
+                // une ligne vide entre deux cartes, et une sous la derniere
+                rowGap: 1,
                 marginBottom: 1,
                 children: list.slice(0, 10).map(card),
               }),

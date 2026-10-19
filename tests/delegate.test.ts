@@ -242,3 +242,34 @@ test('une reprise garde sa session et ne la cherche pas', async ($, on) => {
   expect(run!.join(' ')).toContain('--session ' + SERVER_SID)
   expect(argvs.some((argv) => argv[2] === 'session.list')).toBe(false)
 })
+
+test("la carte montre le titre de session, jamais le debut du prompt", async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  stubEngine(on, clock, new Map())
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await runTask($, clock)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  // le titre qu'opencode a donne a sa session, remonte par le polling
+  expect(await ui.find({ type: 'Text', text: 'Lecture de a.txt' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Lis a\.txt/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('sans titre, la carte ne retombe pas sur le prompt', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, {})
+  stubEngine(on, clock, new Map())
+  listFinds = false // pas de session retrouvee, donc pas de titre
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await runTask($, clock)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Lis a\.txt/ })).toBeUndefined()
+  // la carte existe quand meme, avec son modele
+  expect(await ui.find({ type: 'Text', text: 'gpt-oss:20b' })).toBeDefined()
+  await ui.unmount()
+})

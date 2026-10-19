@@ -30,16 +30,21 @@ Autre   provider/model (457 au catalogue)
 
 ▾ En cours (1)
 ╭────────────────────────────────────────╮
-│ ▸ kimi-k2.7-code ecriture 1m12  $0.0032│
 │ Refactor du module auth                │
+│ ▸ kimi-k2.7-code  ecriture   1m12  $0.0032│
 ╰────────────────────────────────────────╯
+
 ▸ Terminees (3)
 
 4 taches · $0.0043
 ```
 
-Une tâche par carte, bordure colorée selon le statut : bleu en cours, vert
-terminé, rouge en échec, toutes de la même épaisseur. Chaque carte porte aussi
+Une tâche par carte : le titre qu'opencode a donné à sa session en haut, puis
+le modèle, la portée (`lecture` ou `ecriture`), la durée et le coût. Le début
+du prompt n'est jamais affiché — c'est du transcript, illisible en une ligne.
+Tant qu'opencode n'a pas nommé sa session, la carte n'a que sa seconde ligne.
+Bordure colorée selon le statut : bleu en cours, vert terminé, rouge en échec,
+toutes de la même épaisseur. Chaque carte porte aussi
 ce que la tâche avait le droit de faire, `lecture` ou `ecriture`. Les deux listes se
 plient et se déplient en cliquant leur en-tête, ou avec `e` et `t` quand le
 pane a le focus. `tests/delegate.test.ts`, `tests/permissions.test.ts` et
