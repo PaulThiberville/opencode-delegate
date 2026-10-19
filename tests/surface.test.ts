@@ -18,7 +18,13 @@ function stub(on: any, catalog: string) {
   on('session.start', () => ({ cwd: '/work' }))
   on('store.get', () => ({ value: undefined }))
   on('store.set', () => ({ value: undefined }))
-  on('process.run', () => ({ value: { exitCode: 0, stdout: catalog, stderr: '' } }))
+  on('ui.log', () => ({ value: undefined }))
+  on('process.run', ($: any, e: any) => {
+    // le preflight passe avant tout le reste : sans 2.x, le pane ne dessine pas
+    // de selecteur du tout
+    if (e.argv[1] === '--version') return { value: { exitCode: 0, stdout: 'opencode v2.0.32', stderr: '' } }
+    return { value: { exitCode: 0, stdout: catalog, stderr: '' } }
+  })
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['dessine par le moteur'] }))
 }
 

@@ -4,11 +4,15 @@ Mod Claude Code qui utilise **opencode 2** comme sous-agent.
 
 ## Ce que ça fait
 
+- Sonde `opencode --version` au démarrage de la session et n'enregistre l'outil
+  que si opencode est en 2.x. Sans ça, rien n'est proposé à Claude.
 - Enregistre un outil `mcp__opencode-delegate__delegate` que Claude peut appeler
-  comme un `Task`, avec `prompt`, `model`, `agent`, `dir`, `resume`, `budgetMs`.
-- Lance `opencode run --format json --auto --session <id> -m <model>` via
-  `$.process.run`. En v2, `opencode run` parle au **service de fond** : pas de
-  cold start à chaque tâche.
+  comme un `Task`, avec `prompt`, `writeFiles`, `model`, `agent`, `dir`,
+  `resume`, `budgetMs`.
+- Lance `opencode run --format json --session <id> -m <model>` via
+  `$.process.run`, en `--agent plan` (lecture seule) par défaut, et seulement
+  avec `--auto` quand l'utilisateur vient d'autoriser l'écriture. En v2,
+  `opencode run` parle au **service de fond** : pas de cold start à chaque tâche.
 - Pendant le run, un timer interroge `opencode api session.get` toutes les 2 s
   pour remonter coût, tokens et titre dans le pane.
 - `/opencode` ouvre le pane : choix du modèle, liste des tâches, totaux.
@@ -26,7 +30,7 @@ Autre   provider/model (457 au catalogue)
 
 ▾ En cours (1)
 ╭────────────────────────────────────────╮
-│ ▸ kimi-k2.7-code          1m12  $0.0032│
+│ ▸ kimi-k2.7-code ecriture 1m12  $0.0032│
 │ Refactor du module auth                │
 ╰────────────────────────────────────────╯
 ▸ Terminees (3)
@@ -35,11 +39,12 @@ Autre   provider/model (457 au catalogue)
 ```
 
 Une tâche par carte, bordure colorée selon le statut : bleu en cours, vert
-terminé, rouge en échec, toutes de la même épaisseur. Les deux listes se
+terminé, rouge en échec, toutes de la même épaisseur. Chaque carte porte aussi
+ce que la tâche avait le droit de faire, `lecture` ou `ecriture`. Les deux listes se
 plient et se déplient en cliquant leur en-tête, ou avec `e` et `t` quand le
-pane a le focus. `tests/delegate.test.ts` monte le pane avec
-une carte sur les trois surfaces et vérifie que le moteur n'a pas repris la
-main, ce qui est le symptôme d'un arbre refusé.
+pane a le focus. `tests/delegate.test.ts`, `tests/permissions.test.ts` et
+`tests/preflight.test.ts` montent le pane sur les trois surfaces et vérifient
+que le moteur n'a pas repris la main, ce qui est le symptôme d'un arbre refusé.
 
 Le sélecteur **Modele** liste les modèles récents d'abord, puis ceux des mêmes
 fournisseurs, puis le reste du catalogue d'`opencode models`, chargé en tâche
@@ -60,10 +65,80 @@ redémarrage. L'argument `model` de l'outil reste prioritaire sur ce choix, et
 la variable d'environnement `OPENCODE_DELEGATE_MODEL`, si elle est posée,
 l'emporte au démarrage de la session.
 
+## Préflight
+
+`session.start` lance `opencode --version` (`$.process.run`, 5 s de budget,
+try/catch parce que l'appel **rejette** si le binaire ne démarre pas) et lit le
+numéro de version. Si opencode manque, répond en erreur, ou est en 1.x :
+
+- l'outil **n'est pas enregistré** ;
+- le bloc `prompt.context` qui annonce la capacité n'est pas ajouté, sinon on
+  promettrait à Claude un outil qui n'existe pas ;
+- une ligne `$.ui.log` dit une fois ce qui manque et quoi faire ;
+- le catalogue `opencode models` n'est pas chargé ;
+- `/opencode` reste enregistrée, et son pane explique la situation au lieu
+  d'afficher un sélecteur de modèle et une liste vide trompeuse.
+
+Le préflight bloque le premier prompt, donc son budget est court. Il tourne une
+fois par session : une installation d'opencode faite en cours de session n'est
+vue qu'à la session suivante.
+
+## Permissions
+
+Toute délégation part en **lecture seule** : `--agent plan`, l'agent read-only
+d'opencode, et pas de `--auto`. opencode lit le dépôt et rend un compte rendu.
+C'est le mode le plus sûr qui reste utile, et c'est celui que Claude obtient
+sans rien demander.
+
+Pour une tâche qui doit écrire, Claude passe `writeFiles: true`. Le mod demande
+alors à l'utilisateur, par `$.ui.ask`, s'il laisse opencode écrire, en nommant la
+tâche et le répertoire. Trois réponses :
+
+| Réponse | Ce qui part |
+| :- | :- |
+| `Autoriser l'ecriture` | `opencode run --auto`, avec l'`agent` demandé s'il y en a un |
+| `Lecture seule` | la tâche tourne en `--agent plan`, sans `--auto` |
+| `Annuler`, ou la question écartée | **rien** ne s'exécute |
+
+`$.ui.ask` **rejette** quand la question est écartée et dans un `claude -p`, où
+personne ne peut répondre. Dans les deux cas la délégation n'a pas lieu et
+l'outil le dit à Claude, qui peut relancer sans `writeFiles`. Une écriture ne
+peut donc jamais être la conséquence d'un silence.
+
+En lecture seule, l'argument `agent` est **ignoré** et `plan` est imposé : sans
+ça, un `agent: 'build'` choisi par Claude rouvrirait l'écriture par la porte de
+derrière. L'`agent` n'est honoré qu'une fois l'écriture autorisée.
+
+Le pied de page rendu à Claude et la carte du pane nomment le mode retenu, pour
+qu'une tâche dégradée en lecture seule ne passe pas pour une tâche qui a écrit.
+
+### Pourquoi `$.ui.ask` plutôt qu'un argument d'outil ou un interrupteur de pane
+
+Les trois mécanismes étaient sur la table. `$.ui.ask` gagne parce que c'est le
+seul dont l'autorisation vient de l'utilisateur, au moment de l'écriture, pour
+cette écriture-là.
+
+- **Un argument d'outil seul** (`writeFiles: true` et on part) ferait du modèle
+  l'autorité : Claude s'accorderait la permission qu'il demande, et un mod public
+  installé par n'importe qui écrirait dans le dépôt sans que personne ait rien
+  dit. L'argument survit, mais comme **signal** : il déclenche la question, il ne
+  la remplace pas.
+- **Un interrupteur dans le pane** armerait l'écriture une fois, de façon
+  invisible au moment des délégations suivantes, et comme le reste des réglages
+  du pane il vivrait dans `$.store`, partagé par toutes les sessions de la
+  machine : une case cochée un mardi autoriserait les écritures du mercredi dans
+  un autre dépôt. L'écriture ne serait plus la conséquence *directe* d'un choix.
+
+Le coût de ce choix est une question par délégation en écriture, et une
+délégation en écriture impossible en `claude -p`. Les tâches en lecture seule,
+elles, ne demandent rien.
+
 ## Installation
 
 Le CLI `claude` doit être en 2.1.289 ou plus récent (les mods n'existent pas
-avant), et opencode en 2.x, authentifié sur au moins un provider.
+avant), et opencode en **2.x**, authentifié sur au moins un provider. Sans
+opencode 2.x, le mod se charge quand même mais n'enregistre pas l'outil : voir
+[Préflight](#préflight). Vérifier avec `opencode --version`.
 
 ```bash
 claude plugin install opencode-delegate --marketplace PaulThiberville/opencode-delegate
@@ -129,11 +204,19 @@ cd ~/Documents/Dev-Perso/opencode-delegate && claude plugin validate . --strict 
 
 ## Limites connues
 
-- `--auto` auto-approuve les permissions d'opencode : il écrit dans le dépôt
-  sans demander. Pour de vrai, isoler dans un worktree ou passer les permissions
-  dans le pane via `$.ui.ask`.
-- Aucun préflight : si opencode est absent ou en 1.x, l'outil est quand même
-  proposé au modèle, qui l'appellera et recevra un échec lisible mais inutile.
+- Une délégation en écriture est impossible en `claude -p` et dans l'Agent SDK :
+  `$.ui.ask` y rejette, faute de quelqu'un à qui demander. La lecture seule, elle,
+  marche.
+- En lecture seule, la tâche part **sans** `--auto`. Si une configuration locale
+  donne à l'agent `plan` un outil qui demande une approbation, opencode attend
+  cette approbation que personne ne lui donnera, et la tâche meurt au timeout.
+  C'est le compromis volontaire : plutôt un échec visible qu'un `--auto` qui
+  approuverait une écriture.
+- La fenêtre d'autorisation porte sur la délégation entière, pas sur chaque
+  fichier : une fois l'écriture autorisée, `--auto` approuve tout ce qu'opencode
+  fait dans cette tâche. Pour un vrai cloisonnement, isoler dans un worktree.
+- Le préflight ne tourne qu'au démarrage de la session : installer opencode
+  ensuite demande de relancer la session, ou `/reload-plugins`.
 - Pas de garde-fou contre deux agents qui éditent le même fichier en parallèle.
 - Le bloc de contexte qui annonce la capacité aux agents **ne s'exécute pas**
   pour un plugin installé par une personne quand une organisation gère Claude

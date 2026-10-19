@@ -21,6 +21,12 @@ const CATALOG = ['ollama-cloud/gpt-oss:20b', 'ollama-cloud/kimi-k2.7-code', 'ope
 const SERVER_SID = 'ses_eac681071ffewObMBj6e5N7Ykt'
 let createFails = false
 
+// Ce que `opencode --version` repond, et ce que l'utilisateur repond a la
+// question d'autorisation d'ecriture ; chaque test peut les changer
+const ALLOW = "Autoriser l'ecriture"
+let version = 'opencode v2.0.32'
+let askAnswer = ALLOW
+
 const PANE = {
   plugin: 'opencode-delegate',
   component: 'Pane',
@@ -39,6 +45,8 @@ const PANE = {
 // Branche les reponses du moteur et rend de quoi inspecter ce qui s'est passe
 function stubEngine(on: any, clock: any, saved: Map<string, unknown>) {
   createFails = false
+  version = 'opencode v2.0.32'
+  askAnswer = ALLOW
   const argvs: string[][] = []
   on('tool.register', () => ({ value: undefined }))
   on('command.register', () => ({ value: undefined }))
@@ -53,9 +61,16 @@ function stubEngine(on: any, clock: any, saved: Map<string, unknown>) {
     saved.set(e.key, e.value)
     return { value: undefined }
   })
+  // L'autorisation d'ecriture passe par `$.ui.ask`, que le moteur sert comme un
+  // appel a AskUserQuestion. Par defaut la question est autorisee.
+  on('tool.call', ($: any, e: any) => {
+    const question = e.questions[0].question
+    return { result: { answers: { [question]: askAnswer } } }
+  })
   on('process.run', async ($: any, e: any) => {
     const argv: string[] = e.argv
     argvs.push(argv)
+    if (argv[1] === '--version') return { value: { exitCode: 0, stdout: version, stderr: '' } }
     if (argv[1] === 'models') return { value: { exitCode: 0, stdout: CATALOG, stderr: '' } }
     if (argv[2] === 'session.create') {
       if (createFails) return { value: { exitCode: 1, stdout: '', stderr: 'service injoignable' } }
@@ -161,6 +176,7 @@ test("un echec d'opencode est rendu comme un resultat lisible", async ($, on) =>
   on('store.get', ($: any, e: any) => ({ value: saved.get(e.key) }))
   on('store.set', () => ({ value: undefined }))
   on('process.run', ($: any, e: any) => {
+    if (e.argv[1] === '--version') return { value: { exitCode: 0, stdout: 'opencode v2.0.32', stderr: '' } }
     if (e.argv[1] !== 'run') return { value: { exitCode: 1, stdout: '', stderr: '' } }
     return {
       value: {
