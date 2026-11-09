@@ -4,8 +4,9 @@ Mod Claude Code qui utilise **opencode 2** comme sous-agent.
 
 ## Ce que ça fait
 
-- Sonde `opencode --version` au démarrage de la session et n'enregistre l'outil
-  que si opencode est en 2.x. Sans ça, rien n'est proposé à Claude.
+- Sonde `opencode --version` au démarrage de la session, puis le CLI de l'app
+  OpenCode Desktop sur macOS, et n'enregistre l'outil que si l'un des deux est en
+  2.x. Sans ça, rien n'est proposé à Claude.
 - Enregistre un outil `mcp__opencode-delegate__delegate` que Claude peut appeler
   comme un `Task`, avec `prompt`, `writeFiles`, `model`, `agent`, `dir`,
   `resume`, `budgetMs`, `background`.
@@ -111,7 +112,14 @@ l'emporte au démarrage de la session.
 
 `session.start` lance `opencode --version` (`$.process.run`, 5 s de budget,
 try/catch parce que l'appel **rejette** si le binaire ne démarre pas) et lit le
-numéro de version. Si opencode manque, répond en erreur, ou est en 1.x :
+numéro de version. Si ce n'est pas une 2.x, il essaie le CLI embarqué par l'app
+OpenCode Desktop sur macOS,
+`/Applications/OpenCode.app/Contents/Resources/opencode-cli`. Le premier en 2.x
+est retenu, et tous les appels du mod passent ensuite par lui : une 2.x dans le
+`PATH` passe donc avant l'app, et une 1.x dans le `PATH` ne bloque pas une app
+à jour.
+
+Si aucun des deux ne convient :
 
 - l'outil **n'est pas enregistré** ;
 - le bloc `prompt.context` qui annonce la capacité n'est pas ajouté, sinon on
@@ -121,9 +129,13 @@ numéro de version. Si opencode manque, répond en erreur, ou est en 1.x :
 - `/opencode` reste enregistrée, et son pane explique la situation au lieu
   d'afficher un sélecteur de modèle et une liste vide trompeuse.
 
-Le préflight bloque le premier prompt, donc son budget est court. Il tourne une
-fois par session : une installation d'opencode faite en cours de session n'est
-vue qu'à la session suivante.
+Le préflight bloque le premier prompt, donc son budget est court : 5 s par
+binaire sondé, 10 s au pire. Il tourne une fois par session : une installation
+d'opencode faite en cours de session n'est vue qu'à la session suivante.
+
+Le chemin du CLI embarqué appartient à l'app et a déjà changé d'une version à
+l'autre. S'il bouge encore, le préflight dit que la délégation est indisponible
+au lieu de planter, et il faut corriger `APP_BIN`.
 
 ## Quand la tâche s'arrête mal
 
@@ -549,9 +561,11 @@ l'interrupteur est désarmé ne part pas du premier coup.
 ## Installation
 
 Le CLI `claude` doit être en 2.1.289 ou plus récent (les mods n'existent pas
-avant), et opencode en **2.x**, authentifié sur au moins un provider. Sans
-opencode 2.x, le mod se charge quand même mais n'enregistre pas l'outil : voir
-[Préflight](#préflight). Vérifier avec `opencode --version`.
+avant), et opencode en **2.x**, authentifié sur au moins un provider : le CLI
+dans le `PATH`, ou sur macOS l'app OpenCode Desktop seule. Sans opencode 2.x, le
+mod se charge quand même mais n'enregistre pas l'outil : voir
+[Préflight](#préflight). Vérifier avec `opencode --version`, ou pour l'app avec
+`/Applications/OpenCode.app/Contents/Resources/opencode-cli --version`.
 
 ```bash
 claude plugin install opencode-delegate --marketplace PaulThiberville/opencode-delegate
