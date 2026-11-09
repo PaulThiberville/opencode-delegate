@@ -153,7 +153,8 @@ let openCalls = {}
 // interrupteur. Il se bascule dans le pane, a cote du selecteur de modele.
 let writeArmed = false
 // Ce que le preflight a trouve ; `reason` est deja une phrase pour l'utilisateur
-let opencode = { isReady: false, version: null, reason: "opencode n'a pas encore ete sonde" }
+// et `bin` le binaire a lancer, partout ou le mod appelle opencode
+let opencode = { isReady: false, bin: 'opencode', version: null, reason: "opencode n'a pas encore ete sonde" }
 
 // Les delegations de fond en vol, par cle, telles qu'on les ecrit dans le store.
 // La verite est ici, en memoire : le store n'en est que la copie durable, ce qui
@@ -170,25 +171,47 @@ let sessionKey = null
 let pendingReports = []
 let isDraining = false
 
-// Sonde `opencode --version` avant d'enregistrer quoi que ce soit. `$.process.run`
+// Le CLI que l'app OpenCode Desktop embarque sur macOS : une machine qui n'a que
+// l'app n'a aucun `opencode` dans son PATH. Ce chemin appartient a l'app et a
+// deja bouge d'une version a l'autre (de Contents/MacOS a Contents/Resources).
+const APP_BIN = '/Applications/OpenCode.app/Contents/Resources/opencode-cli'
+
+// Sonde les binaires dans l'ordre et garde le premier en 2.x : le PATH d'abord,
+// c'est le choix explicite de l'utilisateur, l'app ensuite. Si aucun ne convient,
+// un binaire present mais inutilisable en dit plus qu'un binaire absent : sur une
+// machine sans app, « introuvable » ne doit pas cacher une 1.x dans le PATH.
+async function probeOpencode($) {
+  let failure = null
+  for (const bin of ['opencode', APP_BIN]) {
+    const probed = await probeBinary($, bin)
+    if (probed.isReady) return probed
+    if (!failure || (failure.isMissing && !probed.isMissing)) failure = probed
+  }
+  return failure
+}
+
+// Sonde `<bin> --version` avant d'enregistrer quoi que ce soit. `$.process.run`
 // rejette si le binaire ne demarre pas, d'ou le try/catch ; un code de sortie non
 // nul, lui, revient dans le resultat.
-async function probeOpencode($) {
+async function probeBinary($, bin) {
   let out
   try {
-    out = await $.process.run(['opencode', '--version'], { timeoutMs: PROBE_MS })
+    out = await $.process.run([bin, '--version'], { timeoutMs: PROBE_MS })
   } catch (err) {
     return {
       isReady: false,
+      isMissing: true,
+      bin,
       version: null,
-      reason: "le binaire `opencode` est introuvable ou ne demarre pas (" + err.message + ')',
+      reason: 'le binaire `' + bin + '` est introuvable ou ne demarre pas (' + err.message + ')',
     }
   }
   if (out.exitCode !== 0) {
     return {
       isReady: false,
+      bin,
       version: null,
-      reason: '`opencode --version` a repondu en erreur (code ' + out.exitCode + ')',
+      reason: '`' + bin + ' --version` a repondu en erreur (code ' + out.exitCode + ')',
     }
   }
   // « opencode v2.0.32 », et on accepte toute mise en forme autour du numero
@@ -196,19 +219,21 @@ async function probeOpencode($) {
   if (!found) {
     return {
       isReady: false,
+      bin,
       version: null,
-      reason: '`opencode --version` ne donne pas de numero de version lisible',
+      reason: '`' + bin + ' --version` ne donne pas de numero de version lisible',
     }
   }
   const version = found[0]
   if (Number(found[1]) < MIN_MAJOR) {
     return {
       isReady: false,
+      bin,
       version,
       reason: 'opencode ' + version + ' est trop ancien : la delegation demande une 2.x',
     }
   }
-  return { isReady: true, version, reason: null }
+  return { isReady: true, bin, version, reason: null }
 }
 
 // Ce que l'utilisateur doit faire, quand l'outil n'a pas ete enregistre
@@ -224,7 +249,7 @@ const FIX = 'Installer opencode 2.x (https://opencode.ai), puis relancer la sess
 // honore, et on la retrouve ensuite pour alimenter le suivi live.
 async function findSession($, since, dir) {
   try {
-    const listed = await $.process.run(['opencode', 'api', 'session.list'], { timeoutMs: 10_000 })
+    const listed = await $.process.run([opencode.bin, 'api', 'session.list'], { timeoutMs: 10_000 })
     if (listed.exitCode !== 0) return null
     const body = JSON.parse(listed.stdout)
     const items = body.data || body
@@ -304,7 +329,7 @@ async function recoverPartial($, sessionId) {
   let out
   try {
     out = await $.process.run(
-      ['opencode', 'api', 'session.message.list', '--param', 'sessionID=' + sessionId],
+      [opencode.bin, 'api', 'session.message.list', '--param', 'sessionID=' + sessionId],
       { timeoutMs: RECOVER_MS },
     )
   } catch {
@@ -1299,7 +1324,7 @@ async function runDelegation($, spec, next, job) {
     }
     try {
       const probe = await $.process.run(
-        ['opencode', 'api', 'session.get', '--param', 'sessionID=' + watched],
+        [opencode.bin, 'api', 'session.get', '--param', 'sessionID=' + watched],
         { timeoutMs: 10_000 },
       )
       if (probe.exitCode !== 0) return
@@ -1326,7 +1351,7 @@ async function runDelegation($, spec, next, job) {
   // `--auto` auto-approuve tout ce qui n'est pas explicitement refuse : il ne
   // sort que pour une ecriture autorisee a l'instant par l'utilisateur. En
   // lecture seule, l'agent `plan` n'a pas d'outil d'ecriture et rien a approuver.
-  const argv = ['opencode', 'run', '--format', 'json', '-m', model]
+  const argv = [opencode.bin, 'run', '--format', 'json', '-m', model]
   if (mayWrite) argv.push('--auto')
   if (spec.resume) argv.push('--session', spec.resume)
   if (agent) argv.push('--agent', agent)
@@ -1669,7 +1694,7 @@ export function register(on) {
     // Sans opencode, le pane n'affiche pas de selecteur : rien a charger.
     if (opencode.isReady) $.clock.after(0, async () => {
       try {
-        const listing = await $.process.run(['opencode', 'models'], { timeoutMs: 20_000 })
+        const listing = await $.process.run([opencode.bin, 'models'], { timeoutMs: 20_000 })
         if (listing.exitCode !== 0) return
         catalog = listing.stdout
           .split('\n')
@@ -2055,7 +2080,7 @@ export function register(on) {
                   redraw()
                   try {
                     await $.process.run(
-                      ['opencode', 'api', 'session.interrupt', '--param', 'sessionID=' + task.sessionId],
+                      [opencode.bin, 'api', 'session.interrupt', '--param', 'sessionID=' + task.sessionId],
                       { timeoutMs: 10_000 },
                     )
                   } catch {
